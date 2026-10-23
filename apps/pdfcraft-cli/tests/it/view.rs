@@ -115,6 +115,45 @@ fn each_page_is_a_png_shown_at_the_cursor() {
     }
 }
 
+/// `view` takes the owner password as `render` does, also of revision 2–4 files, whose owner
+/// password the renderer doesn't take: what reaches it is the user password owner authentication
+/// recovers (#2670). A wrong password still shows nothing.
+#[test]
+fn either_password_opens_a_protected_file_of_any_revision() {
+    for algorithm in crate::owner_password::ALGORITHMS {
+        let pdf = tmp("passwords", &format!("{algorithm:?}.pdf"));
+        std::fs::write(&pdf, crate::owner_password::protected(algorithm)).unwrap();
+        for password in ["user", "owner"] {
+            let out = view(&pdf, &["--password", password, "--protocol", "kitty"]);
+            assert!(out.status.success(), "{algorithm:?} with {password:?}: {}", text(&out.stderr));
+            let drawn = images(&out.stdout);
+            assert_eq!(drawn.len(), 1, "{algorithm:?} with {password:?}");
+            let (w, h) = png_size(&drawn[0].png);
+            assert!((w as f32 / h as f32 - 200.0 / 300.0).abs() < 0.01, "{algorithm:?} with {password:?}: {w}×{h}");
+        }
+        let out = view(&pdf, &["--password", "wrong", "--protocol", "kitty"]);
+        assert!(!out.status.success() && out.stdout.is_empty(), "{algorithm:?} with a wrong password");
+    }
+}
+
+/// A dynamic XFA form shows the pages its template lays out into, as `render`, `text` and the
+/// app do (#1645), not the placeholder page the file carries; the file itself is left alone.
+#[test]
+fn a_dynamic_xfa_form_shows_its_laid_out_pages() {
+    let pdf = crate::xfa::fixture("view");
+    let original = std::fs::read(&pdf).unwrap();
+    let out = view(&pdf, &["--protocol", "kitty"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let drawn = images(&out.stdout);
+    assert_eq!(drawn.len(), 2, "the form lays out into two pages; the file has one placeholder");
+    for image in &drawn {
+        let (w, h) = png_size(&image.png);
+        // 200 × 300 pt, the form's medium: the placeholder is US Letter.
+        assert!((w as f32 / h as f32 - 200.0 / 300.0).abs() < 0.01, "{w}×{h}");
+    }
+    assert_eq!(std::fs::read(&pdf).unwrap(), original, "viewing must not write the layout to the file");
+}
+
 #[test]
 fn fit_width_is_wider_than_fit_page() {
     let pdf = fixture("fit", 1);

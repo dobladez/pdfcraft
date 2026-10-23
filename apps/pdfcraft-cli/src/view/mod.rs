@@ -16,9 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use pdfcraft_engine::export::PngEffort;
-use pdfcraft_render::{PageRenderer, RenderConfig, RenderPool, RenderRequest, RenderWarning, RenderedPage, RequestKind, inspect};
+use pdfcraft_render::{PageRenderer, RenderConfig, RenderPool, RenderRequest, RenderWarning, RenderedPage, RequestKind};
 
-use crate::{CliError, OptionSpec, flag, page_list, read, validate_options};
+use crate::{CliError, OptionSpec, displayed, flag, page_list, read, validate_options};
 use fit::{Cell, Fit, Layout};
 use kitty::{IdColor, Wrap};
 use tty::{Tty, WindowSize};
@@ -457,17 +457,16 @@ struct Image {
 
 impl Doc {
     fn open(path: &str, password: Option<&str>) -> Result<Self, CliError> {
-        let bytes = read(path)?;
-        let info = inspect(bytes.clone(), password).map_err(|e| format!("{path}: {e}"))?;
+        // What `render` draws: the app's display copy, with the password the renderer takes.
+        let display = displayed("view", path, read(path)?, password)?;
+        let info = display.info.map_err(|e| format!("{path}: {e}"))?;
         let count = info.pages.len();
         if count == 0 {
             return Err(format!("{path}: no pages to show").into());
         }
         Ok(Self {
-            // The display copy, as `render` and the app use: comments missing their appearance
-            // streams are drawn too.
-            bytes: pdfcraft_engine::display_bytes_for(bytes, password),
-            config: RenderConfig { password: password.map(Arc::from), reject_oversize: true, ..Default::default() },
+            bytes: display.bytes,
+            config: RenderConfig { password: display.password.as_deref().map(Arc::from), reject_oversize: true, ..Default::default() },
             sizes: info.pages.iter().map(|p| (p.width, p.height)).collect(),
             count,
         })

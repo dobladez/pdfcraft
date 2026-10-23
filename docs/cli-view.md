@@ -24,6 +24,10 @@ Printed pages are drawn one under another and stay in the terminal's scrollback,
 text that `cat` prints. `--pages` takes the same list as `extract`: single pages and ranges, in
 the order given. Without it, `view` shows the whole document.
 
+The pages are the ones `render` and the app draw: comments without an appearance of their own are
+drawn too, and a dynamic XFA form shows the pages its template lays out into, not the
+placeholder page the file carries for viewers that can't.
+
 To write an image file instead, use `render`:
 `pdfcraft-cli render report.pdf --page 1 --out page.png`.
 
@@ -44,7 +48,7 @@ behind each choice) is in [`apps/pdfcraft-cli/src/view/README.md`](../apps/pdfcr
 | `--compression small` | PNGs with the fewest bytes, for a slow link |
 | `--protocol auto` | check that the terminal can show images first (the default) |
 | `--protocol kitty` | skip the check and send the escape codes anyway, even to a file or a pipe |
-| `--password PW` | the password of an encrypted document |
+| `--password PW` | the password of an encrypted document: the user or the owner password |
 
 ## Paging through a document
 

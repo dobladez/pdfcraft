@@ -658,6 +658,36 @@ const RENDER_MISSING_OUT: &str = "render: missing --out (.png, .jpg, .tif or .pa
 #[cfg(not(unix))]
 const RENDER_MISSING_OUT: &str = "render: missing --out (.png, .jpg, .tif or .pam)";
 
+/// What `render` and `view` draw for a file, as the app draws it.
+struct Displayed {
+    /// The display copy the renderer reads: comments missing their /AP streams are drawn, and a
+    /// dynamic XFA form is laid out. The CLI must agree with the app (and with independent
+    /// viewers) while keeping the file it reads intact.
+    bytes: Arc<Vec<u8>>,
+    /// The password for the renderer, which takes only the user password of R2–R4 files: for one
+    /// opened with its owner password, the user password that recovers.
+    password: Option<String>,
+    /// The displayed document's pages and the rest (a laid-out form's, not its placeholder's),
+    /// or why the renderer can't open the file.
+    #[cfg_attr(not(unix), expect(dead_code, reason = "only `view`, which is Unix-only, reads it"))]
+    info: Result<pdfcraft_render::DocInfo, String>,
+}
+
+/// [`Displayed`] for the file `bytes` read from `path`, opened with `password` (either one).
+/// `command` names the caller in errors.
+fn displayed(command: &str, path: &str, bytes: Arc<Vec<u8>>, password: Option<&str>) -> Result<Displayed, CliError> {
+    // `Session::open` and the display copy take either password; the renderer doesn't.
+    let render_password = pdfcraft_engine::render_password_for(bytes.clone(), password);
+    let info = inspect(bytes.clone(), render_password.as_deref()).map_err(|e| e.to_string());
+    if info.as_ref().is_ok_and(|info| info.xfa == Some(pdfcraft_render::Xfa::Dynamic)) {
+        let mut session = pdfcraft_engine::Session::new();
+        let id = session.open(path, None, bytes, password).map_err(|e| e.to_string())?;
+        let doc = session.get(id).ok_or_else(|| format!("{command}: the document could not be opened"))?;
+        return Ok(Displayed { bytes: doc.display.clone(), password: render_password, info: Ok(doc.info.clone()) });
+    }
+    Ok(Displayed { bytes: pdfcraft_engine::display_bytes_for(bytes, password), password: render_password, info })
+}
+
 fn render(args: &[String]) -> Result<(), CliError> {
     validate_options("render", args, RENDER_OPTIONS)?;
     let path = *positional(args).first().ok_or("render: missing file")?;
@@ -674,22 +704,11 @@ fn render(args: &[String]) -> Result<(), CliError> {
         Some("pam") => None,
         _ => return Err(format!("render: --out {out}: use a .png, .jpg, .tif or .pam name").into()),
     };
-    // The app renders a display copy that draws comments missing their /AP streams; the CLI
-    // must agree with it (and with independent viewers), while keeping the file it reads intact.
-    let bytes = read(path)?;
-    let password = flag(args, "--password");
-    // The renderer takes only the user password of R2–R4 files; `Session::open` and the display
-    // copy take either.
-    let render_password = pdfcraft_engine::render_password_for(bytes.clone(), password);
-    let display = if inspect(bytes.clone(), render_password.as_deref()).is_ok_and(|info| info.xfa == Some(pdfcraft_render::Xfa::Dynamic)) {
-        let mut session = pdfcraft_engine::Session::new();
-        let id = session.open(path, None, bytes, password).map_err(|e| e.to_string())?;
-        session.get(id).ok_or("render: the document could not be opened")?.display.clone()
-    } else {
-        pdfcraft_engine::display_bytes_for(bytes, password)
-    };
-    let mut r =
-        PageRenderer::new(display, RenderConfig { password: render_password.as_deref().map(Arc::from), reject_oversize: true, ..Default::default() });
+    let display = displayed("render", path, read(path)?, flag(args, "--password"))?;
+    let mut r = PageRenderer::new(
+        display.bytes,
+        RenderConfig { password: display.password.as_deref().map(Arc::from), reject_oversize: true, ..Default::default() },
+    );
     let p = r.render(RenderRequest { page: page_index, kind: RequestKind::Pixels, tile: None, scale: dpi / 72.0, tag: 0, preview: false });
     if let Some(e) = p.error {
         return Err(e.into());
