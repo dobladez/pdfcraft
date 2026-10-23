@@ -275,10 +275,70 @@ fn a_wide_window_shows_two_pages_and_turns_two_at_a_time() {
     view.wait_until("page 3 shown", |t| t.contains(" page 3/3 "));
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(transmitted(&view.text()), 3, "a page was sent again");
-    // d: one page to the screen, from where the reader is; p goes back one page. One page to the
-    // screen is wider, so pages are made again for it.
-    view.press("dp");
-    view.wait_until("page 2 alone", |t| t.contains(" page 2/3 ") && transmitted(t) > 3);
+    // +: one page to the screen, from where the reader is; p goes back one page. A page fits the
+    // height of this window as well beside another as alone, so it is only placed again.
+    view.press("+p");
+    view.wait_until("page 2 alone", |t| t.contains(" page 2/3 · 1 per row "));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(transmitted(&view.text()), 3, "a page was sent again");
+    view.press("q");
+    assert!(view.finish().success());
+}
+
+#[test]
+fn minus_zooms_out_to_rows_of_pages_and_plus_in_to_the_width() {
+    if !pty_works() {
+        return;
+    }
+    let pdf = fixture("zoom", 6);
+    // A tall window: one page to the screen.
+    let mut view = Session::start(&pdf, &["--protocol", "kitty"], 80, 48);
+    view.wait_until("page 1 shown", |t| t.contains(" page 1/6 · 1 per row ") && t.contains("q quit"));
+    // Out twice: three to a row, in two rows, all six pages, each in a place of its own.
+    view.press("--");
+    view.wait_until("six pages shown", |t| t.contains(" pages 1–6/6 · 3 per row ") && (1..=6).all(|p| t.contains(&format!(",p={p},C=1,"))));
+    // In three times: two to a row, one, then as wide as the window, which runs past its bottom.
+    view.press("+++");
+    view.wait_until("the page as wide as the window", |t| t.contains(" page 1/6 · width ") && t.contains(",C=1,c=80,r=47,"));
+    view.press("+");
+    view.wait_until("no further in", |t| t.contains("fully zoomed in"));
+    view.press("q");
+    assert!(view.finish().success());
+}
+
+#[test]
+fn the_next_screen_of_a_grid_is_in_the_terminal_before_the_key() {
+    if !pty_works() {
+        return;
+    }
+    let pdf = fixture("grid", 24);
+    // Three to a row in two rows: six pages a screen. The screen and the two after it are 18
+    // pages, more than the pager keeps for one page to a screen, and all of them stay.
+    let mut view = Session::start(&pdf, &["--protocol", "kitty", "--zoom", "3"], 80, 48);
+    view.wait_until("the screen and two ahead sent", |t| t.contains(" pages 1–6/24 · 3 per row ") && transmitted(t) == 18);
+    std::thread::sleep(Duration::from_millis(200));
+    let before = view.text().len();
+    view.press(" ");
+    view.wait_until("pages 7–12 placed", |t| t.contains(" pages 7–12/24 ") && t[before..].contains("a=p,q=1,"));
+    // Turning to them only placed them: none was sent again first.
+    let after = view.text().split_off(before);
+    let placed = after.find("a=p,q=1,").unwrap_or(0);
+    assert!(after.find("a=t,").is_none_or(|sent| sent > placed), "a page was sent again before the screen showed: {after:?}");
+    view.press("q");
+    assert!(view.finish().success());
+}
+
+#[test]
+fn a_document_shorter_than_the_screen_sits_in_its_middle() {
+    if !pty_works() {
+        return;
+    }
+    let pdf = fixture("short", 3);
+    // Three to a row: one row of pages 17 rows tall, where two would fit. It is in the middle of
+    // the 47 rows above the status line, from row 16, not where the first of two rows would be.
+    let mut view = Session::start(&pdf, &["--protocol", "kitty", "--zoom", "3"], 80, 48);
+    view.wait_until("three pages placed", |t| t.contains(" pages 1–3/3 · 3 per row ") && t.contains(",p=3,C=1,"));
+    assert!(view.text().contains("\x1b[16;1H\x1b_Ga=p,q=1,"), "{:?}", view.text());
     view.press("q");
     assert!(view.finish().success());
 }
@@ -450,6 +510,31 @@ fn no_pager_prints_every_page() {
     let text = view.text();
     assert_eq!(printed(&text), 3, "{text:?}");
     assert!(!text.contains("\x1b[?1049h"), "no alternate screen");
+}
+
+#[test]
+fn printing_follows_the_zoom_in_rows_of_pages() {
+    if !pty_works() {
+        return;
+    }
+    let pdf = fixture("print-zoom", 4);
+    // Three to a row at 80 × 24: pages 25 columns wide with 2 between, and 17 rows tall.
+    let mut view = Session::start(&pdf, &["--protocol", "kitty", "--no-pager", "--zoom", "3"], 80, 24);
+    assert!(view.finish().success());
+    let text = view.text();
+    assert_eq!(printed(&text), 4, "{text:?}");
+    // Each row: lines made for it, back up to its top, each page at its place with the cursor
+    // left there, then down past the row. Pages 1–3, then page 4 a row below.
+    let page = "\x1b_Ga=T,f=100,t=d,q=2,C=1,c=25,r=17,";
+    for (before, times) in [("\x1b[17A\r", 2), ("\r\x1b[27C", 1), ("\r\x1b[54C", 1)] {
+        assert_eq!(text.matches(&format!("{before}{page}")).count(), times, "{before:?}: {text:?}");
+    }
+    assert_eq!(text.matches("\x1b[17B\r").count(), 2, "{text:?}");
+    // Auto at 80 × 24 prints two to a row, as the pager shows them.
+    let mut auto = Session::start(&pdf, &["--protocol", "kitty", "--no-pager"], 80, 24);
+    assert!(auto.finish().success());
+    let text = auto.text();
+    assert_eq!(text.matches("\r\x1b[38C\x1b_Ga=T,f=100,t=d,q=2,C=1,c=36,r=23,").count(), 2, "{text:?}");
 }
 
 #[test]

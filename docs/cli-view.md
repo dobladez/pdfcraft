@@ -7,21 +7,22 @@ and WezTerm speak it, among others. It works on macOS, Linux and FreeBSD, and in
 ```sh
 pdfcraft-cli view report.pdf                    # page through it, like less
 pdfcraft-cli view report.pdf --pages 1,3-5      # page through just these
-pdfcraft-cli view report.pdf --fit width        # as wide as the window
+pdfcraft-cli view report.pdf --zoom width       # as wide as the window
+pdfcraft-cli view report.pdf --zoom 4           # four pages to a row
 pdfcraft-cli view report.pdf --no-pager         # print every page and exit, like cat
 pdfcraft-cli view secret.pdf --password PW
 ```
 
-On a terminal, more than one page opens the pager: one page at a time, or two side by side
-when the window is wide enough. A single page (a one-page document, or `--pages 3`) is printed
+On a terminal, more than one page opens the pager: one page at a time, two side by side when
+the window is wide enough, or zoomed out, rows of them. A single page (a one-page document, or `--pages 3`) is printed
 at the cursor instead, and `view` exits, the way `less -F` prints text that fits.
 
 Output to a file or a pipe takes `--protocol kitty` (without it, `view` stops with an error).
 Then `view` doesn't page: it writes every page's escape codes one after another, and `cat` shows
 them later in a terminal that speaks the protocol.
 
-Printed pages are drawn one under another and stay in the terminal's scrollback, the same as
-text that `cat` prints. `--pages` takes the same list as `extract`: single pages and ranges, in
+Printed pages are drawn in rows one under another and stay in the terminal's scrollback, the
+same as text that `cat` prints. `--pages` takes the same list as `extract`: single pages and ranges, in
 the order given. Without it, `view` shows the whole document.
 
 The pages are the ones `render` and the app draw: comments without an appearance of their own are
@@ -39,8 +40,9 @@ behind each choice) is in [`apps/pdfcraft-cli/src/view/README.md`](../apps/pdfcr
 | Option | Meaning |
 |---|---|
 | `--pages 1,3-5` | the pages to show, in order (default: all of them) |
-| `--fit page` | the whole page fits the window (the default) |
-| `--fit width` | the page is as wide as the window; a tall page runs past the bottom |
+| `--zoom auto` | two pages side by side when the window is wide enough, otherwise one (the default) |
+| `--zoom width` | one page as wide as the window; a tall page runs past the bottom |
+| `--zoom 3` | that many pages to a row, 1 to 8, in as many rows as fit the window |
 | `--pager` | always page, even through a single page |
 | `--no-pager` | never page: print the pages and exit |
 | `--compression auto` | on this machine, temporary files when the terminal takes them and `fast` otherwise; `small` over SSH (the default) |
@@ -50,6 +52,10 @@ behind each choice) is in [`apps/pdfcraft-cli/src/view/README.md`](../apps/pdfcr
 | `--protocol kitty` | skip the check and send the escape codes anyway, even to a file or a pipe |
 | `--password PW` | the password of an encrypted document: the user or the owner password |
 
+Printed without the pager, pages follow the zoom too, a row of them under another: `--zoom 3`
+prints three to a row, `--zoom width` one to a row as wide as the window, and `auto` two to a row
+when the window is wide enough, as the pager first shows them.
+
 ## Paging through a document
 
 The pager shows pages on the alternate screen, like `less`. The shell's scrollback is left as it
@@ -58,27 +64,39 @@ their order.
 
 When the window is wide enough, two pages share it side by side, like an open book: pages 1–2,
 then 3–4, and the keys that turn a page turn both. Two pages go side by side when each keeps at
-least 80% of the size it would have alone, as portrait pages in a wide window do. `d` switches
-between two pages and one; fitting the width always shows one.
+least 80% of the size it would have alone, as portrait pages in a wide window do. Until you zoom,
+the pager decides this again whenever the window changes size.
+
+`-` zooms out: one more page to a row each time, in as many rows as fit the window, so zoomed
+far out the screen is an overview of the document. It stops at 8 pages to a row, or before a page
+would be narrower than 8 columns, and at as many pages as there are. `+` zooms in: one page fewer
+to a row, and from one page, the page as wide as the window, which scrolls; that is as far in as
+it goes. `=` and `_` work too: the same keys, with Shift or without.
+
+Rows start the way a book's spreads do: at three to a row, pages 1–3, 4–6 and so on. The page
+you are on stays on screen as you zoom, and the last row of the document stops at the bottom of
+the screen, the way `less` stops at the last line. The page at the start of your row sets the
+size of every page on screen, and a page is never made smaller to fit another row: at one page
+to a row, a tall window shows landscape pages two or three at a time, one under another.
 
 | Keys | Action |
 |---|---|
-| `space`, `PgDn` | down a screen; at the bottom of a page, on to the next page (or two) |
-| `b`, `PgUp` | up a screen; at the top of a page, back to the previous page (or two) |
-| `j`, `↓`, `Enter` | down a few rows (then on to the next page) |
-| `k`, `↑` | up a few rows (then back to the previous page) |
-| `n`, `→` | next page (or two) |
-| `p`, `←` | previous page (or two) |
+| `space`, `PgDn` | down a screen; at the bottom of a page, on to the next page (or pages) |
+| `b`, `PgUp` | up a screen; at the top of a page, back to the previous page (or pages) |
+| `j`, `↓`, `Enter` | down a few rows (then on to the next page); with pages side by side, down a row of pages |
+| `k`, `↑` | up a few rows (then back to the previous page); with pages side by side, up a row of pages |
+| `n`, `→` | next page (or screen of pages) |
+| `p`, `←` | previous page (or screen of pages) |
 | `g`, `Home` | first page |
 | `G`, `End` | last page |
 | a number, then `Enter` or `g` | that page |
-| `f` | switch between fitting the page and fitting the width |
-| `d` | switch between two pages side by side and one |
+| `-`, `_` | zoom out: one more page to a row |
+| `+`, `=` | zoom in: one page fewer to a row, then the page as wide as the window |
 | `r`, `Ctrl-L` | render the pages again |
 | `q`, `Esc`, `Ctrl-C` | quit |
 
-The pager follows the window: after a resize, the pages are drawn again for the new size, two
-side by side or one as the new size allows. Pages are rendered when they are shown, on a thread
+The pager follows the window: after a resize, the pages are drawn again for the new size, as many
+to a row as you zoomed to, or as the new size allows. Pages are rendered when they are shown, on a thread
 of their own: the keys keep working while a slow page renders (the status line says it is
 rendering), moving on cancels it, and the renderer's watchdog gives up on a page that takes too
 long (20 seconds a try) and says so.

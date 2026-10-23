@@ -19,13 +19,13 @@ use pdfcraft_engine::export::PngEffort;
 use pdfcraft_render::{PageRenderer, RenderConfig, RenderPool, RenderRequest, RenderWarning, RenderedPage, RequestKind};
 
 use crate::{CliError, OptionSpec, displayed, flag, page_list, read, validate_options};
-use fit::{Cell, Fit, Layout};
+use fit::{Area, Cell, Fit, Grid, Layout, Zoom};
 use kitty::{IdColor, Wrap};
 use tty::{Tty, WindowSize};
 
 const OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--pages", takes_value: true },
-    OptionSpec { name: "--fit", takes_value: true },
+    OptionSpec { name: "--zoom", takes_value: true },
     OptionSpec { name: "--protocol", takes_value: true },
     OptionSpec { name: "--password", takes_value: true },
     OptionSpec { name: "--pager", takes_value: false },
@@ -211,7 +211,7 @@ pub(super) fn run(args: &[String]) -> Result<(), CliError> {
 fn view(args: &[String]) -> Result<(), CliError> {
     validate_options("view", args, OPTIONS)?;
     let path = file_arg(args)?;
-    let fit = flag(args, "--fit").map_or(Ok(Fit::Page), Fit::parse)?;
+    let zoom = flag(args, "--zoom").map_or(Ok(Zoom::Auto), Zoom::parse)?;
     let protocol = Protocol::parse(flag(args, "--protocol").unwrap_or("auto"))?;
     let compression = Compression::parse(flag(args, "--compression").unwrap_or("auto"))?;
     let doc = Doc::open(path, flag(args, "--password"))?;
@@ -249,10 +249,10 @@ fn view(args: &[String]) -> Result<(), CliError> {
     if paging {
         let tty = tty.as_ref().ok_or("view: --pager needs a terminal to read keys from")?;
         let name = std::path::Path::new(path).file_name().map_or_else(|| path.into(), |n| n.to_string_lossy());
-        return pager::run(tty, &doc, &name, &terminal, pages, fit, first_id).map_err(|e| format!("view: {e}").into());
+        return pager::run(tty, &doc, &name, &terminal, pages, zoom, first_id).map_err(|e| format!("view: {e}").into());
     }
     let size = tty.as_ref().and_then(Tty::size).unwrap_or(FALLBACK_SIZE);
-    print_pages(&doc, &pages, fit, size, &terminal, first_id)
+    print_pages(&doc, &pages, zoom, size, &terminal, first_id)
 }
 
 /// The one file argument: the token that is neither an option nor an option's value.
@@ -392,9 +392,10 @@ fn note(line: &str) {
     let _ = writeln!(std::io::stderr().lock(), "{}", printable(line));
 }
 
-/// Draw `pages` one under another at the cursor, each fitted to the window, like `cat`. A page
-/// that fails is reported at the end; the others are still drawn.
-fn print_pages(doc: &Doc, pages: &[usize], fit: Fit, size: WindowSize, terminal: &Terminal, first_id: u64) -> Result<(), CliError> {
+/// Draw `pages` at the cursor, one row of them under another, like `cat`: as many to a row as the
+/// pager shows at `zoom` from the first page, each row fitted the way the pager fits the reader's
+/// row. A page that fails is reported at the end; the others are still drawn.
+fn print_pages(doc: &Doc, pages: &[usize], zoom: Zoom, size: WindowSize, terminal: &Terminal, first_id: u64) -> Result<(), CliError> {
     let mut renderer = doc.renderer();
     if renderer.page_count() == 0 {
         return Err("view: the renderer can't read this document".into());
@@ -403,43 +404,122 @@ fn print_pages(doc: &Doc, pages: &[usize], fit: Fit, size: WindowSize, terminal:
     // One row stays free for the shell prompt after the last page.
     let rows = size.rows.saturating_sub(1).max(1);
     let (cols, max_rows) = terminal.output.limits(size.cols);
-    let mut failed = Vec::new();
+    let area = Area { cols, rows, cell, max_rows };
+    let size_of = |i: usize| pages.get(i).and_then(|p| doc.sizes.get(*p)).copied();
+    // Every row has as many pages as the first: `auto` decides once.
+    let first = fit::grid(zoom, pages.len(), 0, size_of, area);
+    let zoom = if first.fit == Fit::Width { Zoom::Width } else { Zoom::PerRow(first.per_row) };
+    let per_row = usize::from(first.per_row.max(1));
+    let (mut failed, mut drawn_rows) = (Vec::new(), 0usize);
     let mut stdout = std::io::stdout().lock();
-    for (n, &page) in pages.iter().enumerate() {
-        let drawn = doc
-            .layout(page, fit, cols, rows, cell, max_rows)
-            .and_then(|layout| encode(&renderer.render(request(page, &layout, 0)), terminal.effort).map(|image| (layout, image)));
-        let (layout, image) = match drawn {
-            Ok(drawn) => drawn,
-            Err(e) => {
-                failed.push(e);
-                continue;
+    for (row, chunk) in pages.chunks(per_row).enumerate() {
+        let start = row.saturating_mul(per_row);
+        let grid = fit::grid(zoom, pages.len(), start, size_of, area);
+        let mut printed = Vec::new();
+        for (slot, &page) in (0u16..).zip(chunk) {
+            let drawn = doc
+                .layout(page, grid.fit, grid.cols, grid.page_rows, cell, max_rows)
+                .and_then(|layout| encode(&renderer.render(request(page, &layout, 0)), terminal.effort).map(|image| (layout, image)));
+            match drawn {
+                Ok((layout, image)) => {
+                    if let Some(warning) = &image.warning {
+                        note(&format!("warning: {warning}"));
+                    }
+                    let index = u64::try_from(start.saturating_add(usize::from(slot))).unwrap_or(u64::MAX);
+                    printed.push(Printed { slot, index, layout, png: image.png });
+                }
+                Err(e) => failed.push(e),
             }
-        };
-        if let Some(warning) = &image.warning {
-            note(&format!("warning: {warning}"));
+        }
+        if printed.is_empty() {
+            continue;
         }
         let mut out = Vec::new();
-        match terminal.output {
-            Output::Direct => {
-                kitty::show_png(&mut out, &image.png, layout.cols, layout.rows);
-                out.push(b'\n');
-            }
-            Output::Tmux(colour) => {
-                let id = colour.id(first_id.wrapping_add(u64::try_from(n).unwrap_or(u64::MAX)));
-                kitty::transmit(&mut out, id, &image.png, Wrap::Tmux);
-                kitty::place_virtual(&mut out, id, layout.cols, layout.rows, Wrap::Tmux);
-                // The layout keeps rows and columns within the placeholders' table.
-                for row in 0..layout.rows {
-                    if kitty::placeholder_row(&mut out, id, colour, row, layout.cols) {
-                        out.push(b'\n');
-                    }
-                }
-            }
+        // Rows of pages side by side have a row between them, as in the pager.
+        if drawn_rows > 0 && grid.per_row > 1 {
+            out.extend(std::iter::repeat_n(b'\n', usize::from(fit::ROW_GAP)));
         }
+        drawn_rows = drawn_rows.saturating_add(1);
+        print_row(&mut out, &printed, grid, terminal.output, first_id);
         stdout.write_all(&out).and_then(|()| stdout.flush()).map_err(CliError::Stdout)?;
     }
     if failed.is_empty() { Ok(()) } else { Err(format!("view: {}", failed.join("; ")).into()) }
+}
+
+/// A page of a printed row: its place in the row, its place in the list (which picks its image
+/// id inside tmux), the cells it covers, and its image.
+struct Printed {
+    slot: u16,
+    index: u64,
+    layout: Layout,
+    png: Vec<u8>,
+}
+
+/// Draw a row of printed pages, at least one, at the cursor where `grid` puts them, and leave the
+/// cursor at the start of the line after it. A page alone in its row is drawn the way text is, the cursor and
+/// the screen moving down with it, so a page taller than the window scrolls by. Pages side by side
+/// go into a band of lines made first, each placed from the band's top with the cursor left
+/// where it is; the band is never taller than the window, so going back up to it always works.
+fn print_row(out: &mut Vec<u8>, row: &[Printed], grid: Grid, output: Output, first_id: u64) {
+    let alone = grid.per_row <= 1;
+    // Where a page goes in the band: across, and down to centre it in its place.
+    let at = |p: &Printed| {
+        let across = p.slot.saturating_mul(grid.cols.saturating_add(fit::GAP)).saturating_add(grid.cols.saturating_sub(p.layout.cols) / 2);
+        if alone { (0, 0) } else { (across, grid.page_rows.saturating_sub(p.layout.rows) / 2) }
+    };
+    match output {
+        Output::Direct if alone => {
+            for p in row {
+                kitty::show_png(out, &p.png, p.layout.cols, p.layout.rows);
+                out.push(b'\n');
+            }
+        }
+        Output::Direct => {
+            let band = grid.page_rows;
+            out.extend(std::iter::repeat_n(b'\n', usize::from(band)));
+            cursor_by(out, band, 'A');
+            for p in row {
+                let (x, y) = at(p);
+                out.push(b'\r');
+                cursor_by(out, x, 'C');
+                cursor_by(out, y, 'B');
+                kitty::show_png_in_place(out, &p.png, p.layout.cols, p.layout.rows);
+                cursor_by(out, y, 'A');
+            }
+            cursor_by(out, band, 'B');
+            out.push(b'\r');
+        }
+        Output::Tmux(colour) => {
+            let id = |p: &Printed| colour.id(first_id.wrapping_add(p.index));
+            for p in row {
+                kitty::transmit(out, id(p), &p.png, Wrap::Tmux);
+                kitty::place_virtual(out, id(p), p.layout.cols, p.layout.rows, Wrap::Tmux);
+            }
+            // A line of text for each row of cells: every page's placeholder cells in its place.
+            let lines = if alone { row.first().map_or(0, |p| p.layout.rows) } else { grid.page_rows };
+            for line in 0..lines {
+                let mut written = 0u16;
+                for p in row {
+                    let (x, y) = at(p);
+                    let Some(cells) = line.checked_sub(y).filter(|r| *r < p.layout.rows) else { continue };
+                    out.extend(std::iter::repeat_n(b' ', usize::from(x.saturating_sub(written))));
+                    // The layout keeps rows and columns within the placeholders' table.
+                    if kitty::placeholder_row(out, id(p), colour, cells, p.layout.cols) {
+                        written = x.max(written).saturating_add(p.layout.cols);
+                    }
+                }
+                out.push(b'\n');
+            }
+        }
+    }
+}
+
+/// Move the cursor `n` cells (`code`: `A` up, `B` down, `C` right); nothing for 0, which the
+/// terminal would take as 1.
+fn cursor_by(out: &mut Vec<u8>, n: u16, code: char) {
+    if n > 0 {
+        out.extend_from_slice(format!("\x1b[{n}{code}").as_bytes());
+    }
 }
 
 /// Where this run's image ids start ([`IdColor::id`]): mixed from the clock and the process id,
@@ -544,7 +624,7 @@ mod tests {
         assert_eq!(file_arg(&args(&["--password", "a.pdf", "b.pdf"])), Ok("b.pdf"));
         // `--pager` takes no value.
         assert_eq!(file_arg(&args(&["--pager", "a.pdf"])), Ok("a.pdf"));
-        assert!(file_arg(&args(&["--fit", "page"])).is_err_and(|e| e.contains("missing file")));
+        assert!(file_arg(&args(&["--zoom", "2"])).is_err_and(|e| e.contains("missing file")));
         assert!(file_arg(&args(&["a.pdf", "b.pdf"])).is_err_and(|e| e.contains("one file at a time")));
         // A value left off the end is not a file.
         assert!(file_arg(&args(&["--pages"])).is_err());

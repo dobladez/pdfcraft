@@ -32,6 +32,12 @@ pub(crate) fn show_png(out: &mut Vec<u8>, png: &[u8], cols: u16, rows: u16) {
     chunked(out, &format!("a=T,f=100,t=d,q=2,c={cols},r={rows}"), png, Wrap::None);
 }
 
+/// [`show_png`], the cursor left where it is (`C=1`): for pages printed side by side, each from
+/// the top of its row.
+pub(crate) fn show_png_in_place(out: &mut Vec<u8>, png: &[u8], cols: u16, rows: u16) {
+    chunked(out, &format!("a=T,f=100,t=d,q=2,C=1,c={cols},r={rows}"), png, Wrap::None);
+}
+
 /// Transmit a PNG as image `id` without showing it (`a=t`); placements show it. Transmitting an
 /// id again replaces the image and deletes its placements.
 pub(crate) fn transmit(out: &mut Vec<u8>, id: u32, png: &[u8], wrap: Wrap) {
@@ -329,6 +335,10 @@ mod tests {
         let mut out = Vec::new();
         show_png(&mut out, b"", 1, 1);
         assert_eq!(out, b"\x1b_Ga=T,f=100,t=d,q=2,c=1,r=1\x1b\\");
+        // In place, the cursor stays.
+        let mut out = Vec::new();
+        show_png_in_place(&mut out, b"", 3, 2);
+        assert_eq!(out, b"\x1b_Ga=T,f=100,t=d,q=2,C=1,c=3,r=2\x1b\\");
     }
 
     /// The bytes inside tmux passthrough sequences, unwrapped. Panics on anything else.

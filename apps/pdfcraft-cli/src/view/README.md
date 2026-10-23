@@ -13,11 +13,11 @@ through tmux, the same answers, the 320 MB quota and the cell size.
 
 | File | What it does |
 |---|---|
-| `mod.rs` | Arguments, the checks before drawing, printing pages without the pager (`--no-pager`, a single page), choosing PNG compression and whether to try temporary files |
+| `mod.rs` | Arguments, the checks before drawing, printing pages without the pager (`--no-pager`, a single page), in rows as zoomed, choosing PNG compression and whether to try temporary files |
 | `detect.rs` | Whether the terminal speaks the protocol, from the environment and its answer to a query, and the terminal's answer about its cell size. Pure |
 | `tty.rs` | `/dev/tty`: size, raw mode, and reads with a timeout through a reader thread (on macOS, `poll(2)` on `/dev/tty` answers `POLLNVAL` at once) |
 | `keys.rs` | Bytes from the terminal into keys, and the terminal's answers to graphics commands. Pure, total over any bytes |
-| `fit.rs` | The render scale and the cells a page covers. Pure arithmetic |
+| `fit.rs` | The render scale and the cells a page covers, the zoom, and how many pages share the window. Pure arithmetic |
 | `kitty.rs` | The protocol's escape codes, and the Unicode placeholders used inside tmux. Pure |
 | `tmux.rs` | Asking tmux: its client's terminal, `allow-passthrough`, SSH, and who shows the pane |
 | `pager.rs` | The pager: navigation (`Nav`, no IO), rendering and sending ahead, what is kept in the terminal, redraws |
@@ -105,8 +105,8 @@ start.
 ## Directly, or inside tmux
 
 Directly, the pager transmits each page as an image of its own and shows it with a placement
-(`a=p`), the cursor left where it is (`C=1`). Each place on screen has a placement id (`p=1`, and
-`p=2` for the second of two pages side by side), so a page given twice shows twice. A page that
+(`a=p`), the cursor left where it is (`C=1`). Each place on screen has a placement id (`p=1` for
+the first, `p=2` for the next and so on, row by row), so a page given twice shows twice. A page that
 leaves the screen loses its placement (`a=d,d=i`) but keeps its data, so showing it again is only
 a placement.
 
@@ -128,6 +128,35 @@ Inside tmux, tmux keeps its own copy of the screen and knows nothing of images:
 - **The terminal.** `TERM` names tmux, so `view` asks tmux for its client's terminal
   (`#{client_termname}`) and cell size (`#{client_cell_width}`, `#{client_cell_height}`).
 
+## Zoom and the grid (`fit.rs`, `pager.rs`)
+
+The zoom (`fit::Zoom`) is a number of pages to a row, or the width. At N to a row, the page at
+the start of the reader's row is fitted into the window's width shared N ways, gaps of 2 columns
+between, and the cells it covers are the place every page on screen is fitted into, centred. As
+many rows of those places as fit go one under another, a row between them. So pages never shrink
+to make room for a row, and in a document of one page size every page renders at one scale, which
+keeps what was sent usable as the reader moves on a row at a time. The same page in a place of
+another size is another render (`View` has the place's size).
+
+`Zoom::Auto` is two to a row when `fit::two_up_fits` says each keeps 80% of its size alone,
+otherwise one, decided at every draw until a key zooms. Zooming out stops at `MAX_PER_ROW` (8),
+before a page would be under `MIN_PAGE_COLS` (8) columns, and at the number of pages; a screen
+holds at most `MAX_ON_SCREEN` (48) pages, which bounds the rows of a strip of short pages.
+
+A screen starts at a multiple of the pages to a row (so two to a row pair pages the way a book's
+spreads do), or higher up near the end, so the last row stays at the bottom. Either way the
+reader's page, which is where zooming and typed pages anchor, is on screen; a property test
+checks it over any keys and draws.
+
+Printing (`print_pages`) uses the same `fit::grid`: the pages to a row come from the first page
+(so `auto` decides once and every row has as many), and each row is fitted as the pager fits the
+reader's row. A page alone in its row is shown with `a=T`, which moves the cursor like text, so a
+page taller than the window (at the width) scrolls by. Pages side by side go into a band: as many
+newlines as the row is tall, scrolling the screen if need be, then the cursor back up to the
+band's top, and each page shown at its column with the cursor left where it is (`C=1`). The band
+is never taller than the window, so going back up always reaches it. Inside tmux, each line of a
+row is the pages' placeholder cells side by side.
+
 ## What is kept in the terminal (`pager.rs`)
 
 The pager works ahead. Two render threads render the pages on screen first, then the next two
@@ -135,9 +164,11 @@ screens and the one before. Each page is sent as soon as it is ready, so turning
 placement. The pages on screen stay up until the next ones are ready, so the screen never goes
 blank in between.
 
-The terminal keeps at most 12 pages, and 192 MiB of pixels (`MAX_SENT`, `BUDGET`). Rendering
-ahead stops at the first page that wouldn't fit, and the least recently shown pages not on screen
-are deleted (`a=d,d=I`) to make room. The byte budget matters. kitty keeps 320 MB of images per
+The terminal keeps at most 12 pages, and 192 MiB of pixels (`MAX_SENT`, `BUDGET`). When a screen
+shows more than 3 pages, the count goes up to the screen and the screens worked on around it:
+with 12, the pages of the screens ahead pushed each other out as they arrived, and turning to
+them rendered them again. Rendering ahead stops at the first page that wouldn't fit, and the
+least recently shown pages not on screen are deleted (`a=d,d=I`) to make room. The byte budget matters. kitty keeps 320 MB of images per
 screen (the protocol's example quota), and past it, it deletes nearly every image without a
 placement at once, not just the oldest. Measured in a hidden kitty with raw images:
 
@@ -210,7 +241,8 @@ only.
 
 ## Tests
 
-- **Unit tests** in each module, among them property tests for the key decoder and the fit.
+- **Unit tests** in each module, among them property tests for the key decoder, the fit and the
+  grid, and that the reader's page stays on screen.
 - **`tests/it/view.rs`**: printing, through a pipe with `--protocol kitty`.
 - **`tests/it/view_pager.rs`**: the pager on a pseudo-terminal from script(1), keys in through its
   stdin. It plays a terminal that takes temporary files (it reads each file named, checks its

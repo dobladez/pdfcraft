@@ -61,12 +61,13 @@ const USAGE: &str = concat!(
 pdfcraft-cli info   <file.pdf> [--password PW]            document summary as JSON
                                                           (includes any declared PDF/A or PDF/UA level)
 pdfcraft-cli render <file.pdf> --page N [--dpi 96] --out x.png   (.png, .jpg, .tif or .pam)
-pdfcraft-cli view   <file.pdf> [--pages 1,3-5] [--fit page|width] [--pager | --no-pager]
+pdfcraft-cli view   <file.pdf> [--pages 1,3-5] [--zoom auto|width|N] [--pager | --no-pager]
                       [--compression auto|fast|small] [--protocol auto|kitty] [--password PW]
                                                            show pages in this terminal: kitty, Ghostty, WezTerm
                                                            (kitty graphics protocol, tmux too; macOS, Linux and FreeBSD);
                                                            more than a page opens a pager, two pages side by side when
-                                                           the window is wide enough
+                                                           the window is wide enough; - and + zoom out to rows of pages
+                                                           and in to the window's width
 pdfcraft-cli text   <file.pdf> [--page N]                  extracted text (pages separated by form feeds)
 pdfcraft-cli edit   <in.pdf> --out out.pdf [--rotate 1,3:90] [--delete 2,4] [--move 5:1]
                       [--insert-blank 1] [--title T] [--author A] [--full]

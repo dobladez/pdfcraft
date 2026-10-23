@@ -57,16 +57,24 @@ struct Drawn {
 }
 
 /// Split stdout into images: escape codes `ESC _G <control> ; <base64> ESC \`, with `m=1` on
-/// every chunk but an image's last. Anything between images must be a newline.
+/// every chunk but an image's last. Anything between images must be a newline, a carriage return
+/// or a cursor move (`ESC [ n A`, `B` or `C`).
 fn images(stdout: &[u8]) -> Vec<Drawn> {
     let mut rest = std::str::from_utf8(stdout).unwrap();
     let (mut out, mut keys, mut payload) = (Vec::new(), None::<String>, String::new());
     while !rest.is_empty() {
-        if keys.is_none()
-            && let Some(after) = rest.strip_prefix('\n')
-        {
-            rest = after;
-            continue;
+        if keys.is_none() {
+            if let Some(after) = rest.strip_prefix('\n').or_else(|| rest.strip_prefix('\r')) {
+                rest = after;
+                continue;
+            }
+            if let Some(after) = rest.strip_prefix("\x1b[") {
+                let digits = after.find(|c: char| !c.is_ascii_digit()).unwrap();
+                if digits > 0 && after[digits..].starts_with(['A', 'B', 'C']) {
+                    rest = &after[digits + 1..];
+                    continue;
+                }
+            }
         }
         let body = rest.strip_prefix("\x1b_G").unwrap_or_else(|| panic!("expected an escape code at {:?}", &rest[..rest.len().min(20)]));
         let end = body.find("\x1b\\").unwrap();
@@ -155,14 +163,23 @@ fn a_dynamic_xfa_form_shows_its_laid_out_pages() {
 }
 
 #[test]
-fn fit_width_is_wider_than_fit_page() {
+fn zoom_width_is_wider_than_a_page_to_a_row() {
     let pdf = fixture("fit", 1);
-    let page = images(&view(&pdf, &["--protocol", "kitty"]).stdout);
-    let width = images(&view(&pdf, &["--protocol", "kitty", "--fit", "width"]).stdout);
+    let page = images(&view(&pdf, &["--protocol", "kitty", "--zoom", "1"]).stdout);
+    let width = images(&view(&pdf, &["--protocol", "kitty", "--zoom", "width"]).stdout);
     let (cols_page, cols_width) = (key(&page[0].keys, "c"), key(&width[0].keys, "c"));
     // A portrait page fits the height of any window wider than it is tall in cells.
     assert!(cols_width >= cols_page, "{cols_width} < {cols_page}");
     assert!(png_size(&width[0].png).0 >= png_size(&page[0].png).0);
+    // As the width, the page moves the cursor down and the screen with it, as text does: a page
+    // taller than the window scrolls by.
+    assert!(width[0].keys.starts_with("a=T,f=100,t=d,q=2,c="), "{}", width[0].keys);
+    // One page has no others to share its row: three to a row prints it as one does, and so does
+    // auto.
+    for zoom in ["3", "auto"] {
+        let printed = images(&view(&pdf, &["--protocol", "kitty", "--zoom", zoom]).stdout);
+        assert_eq!((key(&printed[0].keys, "c"), png_size(&printed[0].png)), (cols_page, png_size(&page[0].png)), "--zoom {zoom}");
+    }
 }
 
 #[test]
@@ -188,9 +205,10 @@ fn page_numbers_are_checked_before_anything_is_drawn() {
 fn bad_arguments_say_what_is_allowed() {
     let pdf = fixture("args", 1);
     for (args, expected) in [
-        (&["--fit", "sideways"][..], "use page or width"),
+        (&["--zoom", "sideways"][..], "use auto, width or a number of pages per row (1–8)"),
+        (&["--zoom", "9"], "use auto, width or a number of pages per row (1–8)"),
         (&["--protocol", "sixel"], "use auto or kitty"),
-        (&["--zoom", "2"], "unknown option --zoom"),
+        (&["--fit", "width"], "unknown option --fit"),
         (&["--pages", "0"], "bad page number"),
     ] {
         let out = view(&pdf, args);
@@ -287,6 +305,30 @@ fn inside_tmux_pages_go_through_passthrough_and_placeholders_draw_them() {
     for line in lines {
         assert!(line.starts_with(&format!("\x1b[38;5;{}m", id & 0xff)) && line.ends_with("\x1b[39m"), "{line:?}");
         assert_eq!(line.chars().filter(|c| *c == '\u{10EEEE}').count(), cols as usize);
+    }
+}
+
+/// Printed inside tmux, pages side by side share their lines of placeholder cells: the first
+/// page's, the gap, then the second's, each in the colour that names its image.
+#[test]
+fn inside_tmux_pages_side_by_side_share_their_lines() {
+    let pdf = fixture("tmux-zoom", 2);
+    let out = view_in_tmux("tmux-zoom", &pdf, &["--protocol", "kitty", "--zoom", "2"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let (codes, after) = passthrough(&out.stdout);
+    let codes = std::str::from_utf8(&codes).unwrap();
+    let placed: Vec<&str> = codes.split("\x1b\\").filter_map(|code| code.strip_prefix("\x1b_Ga=p,U=1,")).collect();
+    assert_eq!(placed.len(), 2, "{codes:?}");
+    let (first, second) = (key(placed[0], "i"), key(placed[1], "i"));
+    assert_ne!(first, second);
+    let (cols, rows) = (key(placed[0], "c"), key(placed[0], "r"));
+    let lines: Vec<&str> = std::str::from_utf8(after).unwrap().split_terminator('\n').collect();
+    assert_eq!(lines.len(), rows as usize);
+    for line in lines {
+        let (left, right) = line.split_once("\x1b[39m  ").unwrap_or_else(|| panic!("no gap between the pages: {line:?}"));
+        assert!(left.starts_with(&format!("\x1b[38;5;{}m", first & 0xff)), "{line:?}");
+        assert!(right.starts_with(&format!("\x1b[38;5;{}m", second & 0xff)) && right.ends_with("\x1b[39m"), "{line:?}");
+        assert_eq!(line.chars().filter(|c| *c == '\u{10EEEE}').count(), 2 * cols as usize);
     }
 }
 

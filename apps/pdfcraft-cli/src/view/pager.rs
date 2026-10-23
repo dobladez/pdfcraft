@@ -1,5 +1,6 @@
-//! `view --pager`: one page at a time on the alternate screen, like `less`, or two side by side
-//! when the window is wide enough, turning two at a time like a book's.
+//! `view --pager`: pages on the alternate screen, like `less`. One at a time, or two side by side
+//! when the window is wide enough, turning two at a time like a book's; zoomed out, rows of
+//! them; zoomed in, one as wide as the window.
 //!
 //! [`Nav`] is where the reader is and what each key does, with no IO. [`Pager`] renders and
 //! draws what `Nav` says, and [`Screen`] puts the terminal back however the pager ends.
@@ -29,7 +30,7 @@ use pdfcraft_engine::export::PngEffort;
 use pdfcraft_render::{RenderPool, RenderedPage};
 
 use super::files::{Files, Written};
-use super::fit::{self, Cell, FALLBACK_CELL, Fit, Layout};
+use super::fit::{self, Area, Cell, FALLBACK_CELL, Fit, Grid, Layout, Zoom};
 use super::keys::{self, Key};
 use super::kitty::{self, Rect};
 use super::tty::{RawMode, Tty, WindowSize};
@@ -53,7 +54,8 @@ const PENDING_LIMIT: Duration = Duration::from_secs(1);
 /// Screens rendered and sent ahead of the one on screen, and behind it.
 const AHEAD: usize = 2;
 const BEHIND: usize = 1;
-/// Pages kept in the terminal, ready to show at once: the most recently shown stay.
+/// Pages kept in the terminal, ready to show at once: the most recently shown stay. More when a
+/// screen shows many pages, so the screens around it stay too.
 const MAX_SENT: usize = 12;
 /// The most bytes of pixels kept in the terminal. kitty keeps 320 MB of images per screen, and
 /// past that drops nearly every image not on screen at once; inside tmux, other panes' images
@@ -76,11 +78,11 @@ const MAX_RESENDS: u32 = 8;
 /// none of them lands on the command line.
 const ANSWER_WAIT: Duration = Duration::from_millis(100);
 /// The reminder of the keys on the status line, shorter and shorter for a narrow window.
-const KEYS: [&str; 3] = ["space b j k · n p · g G · 12⏎ · f fit · d two-up · q quit", "n p · f fit · d two-up · q quit", "n p · q quit"];
+const KEYS: [&str; 3] = ["space b j k · n p · g G · 12⏎ · + - zoom · q quit", "n p · + - zoom · q quit", "n p · q quit"];
 
 /// Page through `pages` of `doc` until the user quits. Image ids are taken in turn from
 /// `first_id` on ([`super::kitty::IdColor::id`]).
-pub(super) fn run(tty: &Tty, doc: &Doc, name: &str, terminal: &Terminal, pages: Vec<usize>, fit: Fit, first_id: u64) -> Result<(), String> {
+pub(super) fn run(tty: &Tty, doc: &Doc, name: &str, terminal: &Terminal, pages: Vec<usize>, zoom: Zoom, first_id: u64) -> Result<(), String> {
     // Inside tmux: who shows the pane, before any image goes.
     let mut watch = None;
     let mut showing = 1;
@@ -100,11 +102,12 @@ pub(super) fn run(tty: &Tty, doc: &Doc, name: &str, terminal: &Terminal, pages: 
         output: terminal.output,
         cell: terminal.cell,
         effort: terminal.effort,
-        nav: Nav::new(pages, doc.count, fit),
+        nav: Nav::new(pages, doc.count, zoom),
         sent: Vec::new(),
+        kept: MAX_SENT,
         wanted: Vec::new(),
         failed: Vec::new(),
-        on_screen: [None, None],
+        on_screen: Vec::new(),
         placed: Vec::new(),
         size: None,
         first_id,
@@ -212,12 +215,14 @@ struct Nav {
     at: usize,
     /// Pages in the document.
     count: usize,
-    fit: Fit,
-    /// Two pages side by side when they fit (`d` turns it off and on).
-    two_up: bool,
-    /// From the last draw: pages on screen (1 or 2), the image rows on screen, and the most
-    /// `scroll` can be.
-    per_screen: usize,
+    /// As asked: `--zoom`, then `+` and `-`.
+    zoom: Zoom,
+    /// From the last draw: pages to a row, rows of pages, and the most pages to a row the window
+    /// takes. A zoom key sets the first two at once, so keys before the next draw step by them.
+    per_row: u16,
+    grid_rows: u16,
+    most_per_row: u16,
+    /// From the last draw: the first page's image rows on screen, and the most `scroll` can be.
     visible: u16,
     max_scroll: u16,
     /// Image rows scrolled off the top. Past the bottom until the next draw clamps it.
@@ -231,14 +236,15 @@ struct Nav {
 }
 
 impl Nav {
-    fn new(pages: Vec<usize>, count: usize, fit: Fit) -> Self {
+    fn new(pages: Vec<usize>, count: usize, zoom: Zoom) -> Self {
         Self {
             pages,
             at: 0,
             count,
-            fit,
-            two_up: true,
-            per_screen: 1,
+            zoom,
+            per_row: 1,
+            grid_rows: 1,
+            most_per_row: fit::MAX_PER_ROW,
             visible: 1,
             max_scroll: 0,
             scroll: 0,
@@ -248,24 +254,37 @@ impl Nav {
         }
     }
 
-    /// Where in `pages` the screen starts. Two pages side by side are always an even place and
-    /// the odd one after it, the way a book's spreads pair them.
-    fn first(&self) -> usize {
-        if self.per_screen == 2 { self.at - self.at % 2 } else { self.at }
+    /// Pages to a row.
+    fn row(&self) -> usize {
+        usize::from(self.per_row.max(1))
     }
 
-    /// The pages on screen: the one alone, or the two side by side (the second missing past the
-    /// end).
-    fn on_screen(&self) -> [Option<usize>; 2] {
+    /// Pages on screen: every row of them.
+    fn per_screen(&self) -> usize {
+        self.row().saturating_mul(usize::from(self.grid_rows.max(1)))
+    }
+
+    /// Where in `pages` the screen starts: at the start of the reader's row of pages (so two side
+    /// by side are an even place and the odd one after it, the way a book's spreads pair them).
+    /// Near the end, higher up, so the last row of pages is at the bottom of the screen, as `less`
+    /// keeps the last line there. Either way the reader's page is on screen.
+    fn first(&self) -> usize {
+        let row = self.row();
+        let last = self.pages.len().saturating_sub(1);
+        let last_screen = last.saturating_sub(last % row).saturating_sub(self.per_screen().saturating_sub(row));
+        self.at.saturating_sub(self.at % row).min(last_screen)
+    }
+
+    /// The pages on screen, row by row (missing past the end).
+    fn on_screen(&self) -> Vec<Option<usize>> {
         let first = self.first();
-        let second = if self.per_screen == 2 { self.pages.get(first.saturating_add(1)).copied() } else { None };
-        [self.pages.get(first).copied(), second]
+        (first..first.saturating_add(self.per_screen())).map(|i| self.pages.get(i).copied()).collect()
     }
 
     /// The pages worth having ready around the screen, nearest first: the next `ahead` screens,
     /// then the `behind` screens before.
     fn around(&self, ahead: usize, behind: usize) -> Vec<usize> {
-        let per = self.per_screen.max(1);
+        let per = self.per_screen();
         let first = self.first();
         let screen = |start: usize| (start..start.saturating_add(per)).filter_map(|i| self.pages.get(i).copied());
         // Both stop at the ends of the list, however many screens are asked for.
@@ -287,38 +306,26 @@ impl Nav {
                 self.typed.pop();
             }
             Key::Enter | Key::Char('g') if typing => self.go_typed(),
-            Key::Char(' ') | Key::PageDown => self.forward(self.visible.max(1)),
-            Key::Char('b') | Key::PageUp => self.back(self.visible.max(1)),
-            Key::Char('j') | Key::Down | Key::Enter => self.forward(STEP),
-            Key::Char('k') | Key::Up => self.back(STEP),
-            Key::Char('n') | Key::Right => self.go(self.first().saturating_add(self.per_screen)),
-            Key::Char('p') | Key::Left => self.go(self.first().saturating_sub(self.per_screen)),
+            Key::Char(' ') | Key::PageDown => self.forward(self.visible.max(1), self.per_screen()),
+            Key::Char('b') | Key::PageUp => self.back(self.visible.max(1), self.per_screen()),
+            Key::Char('j') | Key::Down | Key::Enter => self.forward(STEP, self.row()),
+            Key::Char('k') | Key::Up => self.back(STEP, self.row()),
+            Key::Char('n') | Key::Right => self.go(self.first().saturating_add(self.per_screen())),
+            Key::Char('p') | Key::Left => self.go(self.first().saturating_sub(self.per_screen())),
             Key::Char('g') | Key::Home => self.go(0),
             Key::Char('G') | Key::End => self.go(usize::MAX),
-            // One page to the screen from now on: keys before the next draw step by one.
-            Key::Char('f') => {
-                self.fit = self.fit.toggled();
-                self.scroll = 0;
-                if self.fit == Fit::Width {
-                    self.per_screen = 1;
-                }
-            }
-            Key::Char('d') => {
-                self.two_up = !self.two_up;
-                self.scroll = 0;
-                if !self.two_up {
-                    self.per_screen = 1;
-                }
-            }
+            // `=` and `_` are the same keys as `+` and `-`, with Shift or without.
+            Key::Char('+' | '=') => self.zoom_to(self.zoom.zoomed_in(self.per_row), "fully zoomed in"),
+            Key::Char('-' | '_') => self.zoom_to(self.zoom.zoomed_out(self.per_row, self.most_per_row), "fully zoomed out"),
             Key::Char('r' | '\u{c}') => self.rerender = true,
             _ => {}
         }
         Step::Continue
     }
 
-    /// Down `rows`; from the bottom of the screen's pages, on to the top of the next.
-    fn forward(&mut self, rows: u16) {
-        let next = self.first().saturating_add(self.per_screen);
+    /// Down `rows` image rows; from the bottom of the screen's pages, on `pages` pages.
+    fn forward(&mut self, rows: u16, pages: usize) {
+        let next = self.first().saturating_add(pages);
         if self.scroll < self.max_scroll {
             self.scroll = self.scroll.saturating_add(rows).min(self.max_scroll);
         } else if next < self.pages.len() {
@@ -327,15 +334,29 @@ impl Nav {
         }
     }
 
-    /// Up `rows`; from the top of the screen's pages, back to the bottom of the ones before.
-    fn back(&mut self, rows: u16) {
+    /// Up `rows` image rows; from the top of the screen's pages, back `pages` pages, to the
+    /// bottom of the first.
+    fn back(&mut self, rows: u16, pages: usize) {
         let first = self.first();
         if self.scroll > 0 {
             self.scroll = self.scroll.saturating_sub(rows);
         } else if first > 0 {
-            self.at = first.saturating_sub(self.per_screen);
+            self.at = first.saturating_sub(pages);
             self.scroll = u16::MAX;
         }
+    }
+
+    /// Zoom to `zoom`, or, when there is no further to go, say so with `limit`. Keys before the
+    /// next draw step by the new row of pages; the draw finds how many rows fit.
+    fn zoom_to(&mut self, zoom: Option<Zoom>, limit: &str) {
+        let Some(zoom) = zoom else {
+            self.message = Some(limit.into());
+            return;
+        };
+        self.zoom = zoom;
+        self.scroll = 0;
+        self.per_row = if let Zoom::PerRow(n) = zoom { n.max(1) } else { 1 };
+        self.grid_rows = 1;
     }
 
     /// To the top of the page at `index` in `pages`, or of the last one when past it.
@@ -355,10 +376,17 @@ impl Nav {
         self.typed.clear();
     }
 
-    /// After a draw: `per_screen` pages are on screen, `visible` of the first's `rows` image rows.
-    /// Keeps `scroll` in range.
-    fn shown(&mut self, per_screen: usize, visible: u16, rows: u16) {
-        self.per_screen = per_screen;
+    /// For a draw: `per_row` pages to a row in `grid_rows` rows, of at most `most_per_row` to a
+    /// row in this window.
+    fn grid(&mut self, per_row: u16, grid_rows: u16, most_per_row: u16) {
+        self.per_row = per_row.max(1);
+        self.grid_rows = grid_rows.max(1);
+        self.most_per_row = most_per_row.max(1);
+    }
+
+    /// After a draw: `visible` of the first page's `rows` image rows are on screen. Keeps `scroll`
+    /// in range.
+    fn shown(&mut self, visible: u16, rows: u16) {
         self.visible = visible;
         self.max_scroll = rows.saturating_sub(visible);
         self.scroll = self.scroll.min(self.max_scroll);
@@ -375,12 +403,14 @@ impl Nav {
             (None, true, true) => Some("rendering…".into()),
             (None, true, false) => None,
         };
-        let pages = match self.on_screen() {
-            [Some(a), Some(b)] => format!("pages {}–{}/{}", a.saturating_add(1), b.saturating_add(1), self.count),
-            [Some(a), None] => format!("page {}/{}", a.saturating_add(1), self.count),
-            _ => "no page".into(),
+        let on_screen: Vec<usize> = self.on_screen().into_iter().flatten().collect();
+        let pages = match on_screen.as_slice() {
+            [a, .., b] => format!("pages {}–{}/{}", a.saturating_add(1), b.saturating_add(1), self.count),
+            [a] => format!("page {}/{}", a.saturating_add(1), self.count),
+            [] => "no page".into(),
         };
-        let mut place = format!(" · {pages} · fit {} ", self.fit.name());
+        let zoom = if self.zoom == Zoom::Width { "width".to_owned() } else { format!("{} per row", self.per_row) };
+        let mut place = format!(" · {pages} · {zoom} ");
         if self.pages.len() != self.count {
             place.push_str(&format!("· {} of {} ", self.first().saturating_add(1), self.pages.len()));
         }
@@ -426,12 +456,13 @@ impl Drop for Screen<'_> {
     }
 }
 
-/// A page as drawn: which page, fitted how, into how many columns of what window.
+/// A page as drawn: which page, fitted how, into how many columns and rows of what window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct View {
     page: usize,
     fit: Fit,
     cols: u16,
+    rows: u16,
     size: WindowSize,
 }
 
@@ -476,12 +507,14 @@ struct Pager<'a> {
     nav: Nav,
     /// Pages in the terminal, ready to place, the most recently shown last.
     sent: Vec<Sent>,
+    /// The most pages kept in `sent`: [`MAX_SENT`], or the screen and the screens around it.
+    kept: usize,
     /// Renders asked for, the most urgent first: the pages on screen, then the ones around them.
     wanted: Vec<Wanted>,
     /// Views that failed and why: not asked for again until the window changes or `r`.
     failed: Vec<(View, String)>,
-    /// The views the reader wants on screen, from the last draw.
-    on_screen: [Option<View>; 2],
+    /// The views the reader wants on screen, row by row, from the last draw.
+    on_screen: Vec<Option<View>>,
     /// The images placed on screen by the last full redraw, and under which placement.
     placed: Vec<(u32, u32)>,
     /// The window the pages in `sent` were made for.
@@ -549,27 +582,18 @@ impl Pager<'_> {
             self.placed.clear();
             self.size = Some(size);
         }
-        // Two pages side by side when allowed, fitted to the page, and the window has room: the
-        // spread's first page decides.
-        let nav = &self.nav;
-        let spread_first = nav.pages.get(nav.at - nav.at % 2).and_then(|p| self.doc.sizes.get(*p));
-        let pair = nav.two_up
-            && nav.fit == Fit::Page
-            && nav.pages.len() > 1
-            && spread_first.is_some_and(|(w, h)| fit::two_up_fits(*w, *h, max_cols, area_rows, cell, max_rows));
-        self.nav.per_screen = if pair { 2 } else { 1 };
-        let cols = if pair { fit::two_up_cols(max_cols) } else { max_cols };
-        let fit = self.nav.fit;
-        let view = |page| View { page, fit, cols, size };
-        let on_screen = self.nav.on_screen().map(|page| page.map(view));
-        self.on_screen = on_screen;
+        let grid = self.grid(Area { cols: max_cols, rows: area_rows, cell, max_rows });
+        let view = |page| View { page, fit: grid.fit, cols: grid.cols, rows: grid.page_rows, size };
+        let on_screen: Vec<Option<View>> = self.nav.on_screen().into_iter().map(|page| page.map(view)).collect();
+        self.on_screen.clone_from(&on_screen);
+        self.kept = MAX_SENT.max(on_screen.len().saturating_mul(1 + AHEAD + BEHIND));
 
         // What to have ready, most urgent first: the pages on screen, then the next screens, then
         // the one before, as far as they stay in the terminal together (`budget`). Renders already
         // under way for any of them carry on; the rest stop.
         let mut wanted = Vec::new();
         let mut near = 0u64;
-        for v in on_screen.into_iter().flatten().chain(self.nav.around(AHEAD, BEHIND).into_iter().map(view)) {
+        for v in on_screen.iter().flatten().copied().chain(self.nav.around(AHEAD, BEHIND).into_iter().map(view)) {
             if self.failed.iter().any(|(f, _)| *f == v) || wanted.iter().any(|w: &Wanted| w.view == v) {
                 continue;
             }
@@ -579,7 +603,7 @@ impl Pager<'_> {
             }
             let next = match self.wanted.iter().position(|w| w.view == v) {
                 Some(at) => Ok(self.wanted.swap_remove(at)),
-                None => self.doc.layout(v.page, v.fit, v.cols, area_rows, cell, max_rows).map(|layout| {
+                None => self.doc.layout(v.page, v.fit, v.cols, v.rows, cell, max_rows).map(|layout| {
                     self.tag = self.tag.wrapping_add(1);
                     Wanted { view: v, layout, tag: self.tag }
                 }),
@@ -602,15 +626,16 @@ impl Pager<'_> {
         if self.nav.message.is_none() {
             self.nav.message = note(&on_screen, &self.sent, &self.failed);
         }
-        // Scrolling follows the first page on screen; two side by side always fit.
-        let first_rows = on_screen[0].and_then(|v| self.rows(&v)).unwrap_or(area_rows);
-        self.nav.shown(self.nav.per_screen, first_rows.min(area_rows), if pair { first_rows.min(area_rows) } else { first_rows });
+        // Scrolling follows the first page on screen: only one as wide as the window is ever
+        // taller than the window.
+        let first_rows = on_screen.first().copied().flatten().and_then(|v| self.rows(&v)).unwrap_or(area_rows);
+        self.nav.shown(first_rows.min(area_rows), first_rows);
 
         // Synchronized output, where the terminal has it, shows the redraw all at once.
         out.extend_from_slice(b"\x1b[?2026h");
         let ready = on_screen.iter().flatten().all(|v| self.sent.iter().any(|s| s.view == *v) || self.failed.iter().any(|(f, _)| f == v));
         if ready || self.placed.is_empty() {
-            self.place(&mut out, size, area_rows, cols, pair);
+            self.place(&mut out, size, area_rows, grid);
         }
         cursor(&mut out, size.rows.saturating_sub(1), 0);
         out.extend_from_slice(b"\x1b[2K\x1b[7m");
@@ -618,6 +643,15 @@ impl Pager<'_> {
         out.extend_from_slice(b"\x1b[0m\x1b[?2026l");
         self.wrote(0);
         self.tty.write_all(&out)
+    }
+
+    /// How the pages share the window's `area`: as the reader zoomed, from where the reader is,
+    /// as far as the window takes ([`fit::grid`]).
+    fn grid(&mut self, area: Area) -> Grid {
+        let (nav, sizes) = (&self.nav, &self.doc.sizes);
+        let grid = fit::grid(nav.zoom, nav.pages.len(), nav.at, |i| nav.pages.get(i).and_then(|p| sizes.get(*p)).copied(), area);
+        self.nav.grid(grid.per_row, grid.rows, grid.most);
+        grid
     }
 
     /// Note a write, with `images` transmissions in it: inside tmux, ask a moment later whether
@@ -703,46 +737,49 @@ impl Pager<'_> {
         }
     }
 
-    /// Put the pages on screen in place of the ones before: centred, one page or two with a gap
-    /// (a last page alone keeps the left place). Each place on screen has a placement of its own,
-    /// so a page given twice shows twice.
-    fn place(&mut self, out: &mut Vec<u8>, size: WindowSize, area_rows: u16, cols: u16, pair: bool) {
+    /// Put the pages on screen in place of the ones before, laid out as `grid` says: the rows of
+    /// pages centred, each page centred in its place, and a short last row keeping the places on
+    /// the left. Each place on screen has a placement of its own, so a page given twice shows twice.
+    fn place(&mut self, out: &mut Vec<u8>, size: WindowSize, area_rows: u16, grid: Grid) {
         let wrap = self.output.wrap();
         // Erasing text never erases images (only clearing the whole screen does, by the
         // protocol): placements are what show and move them.
         for row in 1..=size.rows {
             out.extend_from_slice(format!("\x1b[{row};1H\x1b[2K").as_bytes());
         }
-        let sent = |v: Option<View>| v.and_then(|v| self.sent.iter().position(|s| s.view == v));
-        let at = [sent(self.on_screen[0]), sent(self.on_screen[1])];
-        let width = |i: usize| at.get(i).copied().flatten().and_then(|p| self.sent.get(p)).map_or(cols, |s| s.cols);
-        let widths = [width(0), if pair { width(1) } else { 0 }];
-        let total = if pair { widths[0].saturating_add(fit::TWO_UP_GAP).saturating_add(widths[1]) } else { widths[0] };
-        let mut left = size.cols.saturating_sub(total) / 2;
-        let scroll = if pair { 0 } else { self.nav.scroll };
+        let per_row = grid.per_row.max(1);
+        let (across, down) = (grid.cols.saturating_add(fit::GAP), grid.page_rows.saturating_add(fit::ROW_GAP));
+        let width = across.saturating_mul(per_row).saturating_sub(fit::GAP);
+        // Centred on the rows that have pages: a document shorter than the screen sits in the
+        // middle of it, not at the top.
+        let last = self.on_screen.iter().rposition(Option::is_some).unwrap_or(0);
+        let rows = u16::try_from(last / usize::from(per_row)).map_or(grid.rows, |r| r.saturating_add(1).min(grid.rows));
+        let height = down.saturating_mul(rows).saturating_sub(fit::ROW_GAP);
+        let (left, top) = (size.cols.saturating_sub(width) / 2, area_rows.saturating_sub(height) / 2);
+        // Only a page as wide as the window scrolls; the draw keeps the others' scroll at 0.
+        let scroll = self.nav.scroll;
         let mut placed = Vec::new();
-        for ((position, width), placement) in at.into_iter().zip(widths).zip(1u32..) {
-            if let Some(s) = position.and_then(|p| self.sent.get(p)) {
-                let visible = s.rows.min(area_rows);
-                let top = area_rows.saturating_sub(visible) / 2;
-                match self.output {
-                    Output::Direct => {
-                        cursor(out, top, left);
-                        let src = (visible < s.rows).then(|| source_rows(s, scroll, visible));
-                        kitty::place(out, s.id, placement, s.cols, visible, src, wrap);
-                        self.placed_at = Some(Instant::now());
-                    }
-                    Output::Tmux(colour) => {
-                        for row in 0..visible {
-                            cursor(out, top.saturating_add(row), left);
-                            // Within the placeholders' table: the layout keeps it so.
-                            let _ = kitty::placeholder_row(out, s.id, colour, scroll.saturating_add(row), s.cols);
-                        }
+        for ((slot, view), placement) in (0u16..).zip(&self.on_screen).zip(1u32..) {
+            let Some(s) = view.and_then(|v| self.sent.iter().find(|s| s.view == v)) else { continue };
+            let visible = s.rows.min(area_rows);
+            let left = left.saturating_add((slot % per_row).saturating_mul(across)).saturating_add(grid.cols.saturating_sub(s.cols) / 2);
+            let top = top.saturating_add((slot / per_row).saturating_mul(down)).saturating_add(grid.page_rows.saturating_sub(visible) / 2);
+            match self.output {
+                Output::Direct => {
+                    cursor(out, top, left);
+                    let src = (visible < s.rows).then(|| source_rows(s, scroll, visible));
+                    kitty::place(out, s.id, placement, s.cols, visible, src, wrap);
+                    self.placed_at = Some(Instant::now());
+                }
+                Output::Tmux(colour) => {
+                    for row in 0..visible {
+                        cursor(out, top.saturating_add(row), left);
+                        // Within the placeholders' table: the layout keeps it so.
+                        let _ = kitty::placeholder_row(out, s.id, colour, scroll.saturating_add(row), s.cols);
                     }
                 }
-                placed.push((s.id, placement));
             }
-            left = left.saturating_add(width).saturating_add(fit::TWO_UP_GAP);
+            placed.push((s.id, placement));
         }
         // The pages before leave the screen; their data stays in the terminal for later. Inside
         // tmux, erasing their placeholder cells already did it.
@@ -784,7 +821,7 @@ impl Pager<'_> {
                 Ok((warning, Some(payload))) => {
                     let mut out = Vec::new();
                     let bytes = u64::from(width).saturating_mul(u64::from(height)).saturating_mul(4);
-                    for gone in make_room(&mut self.sent, bytes, self.budget, &self.on_screen) {
+                    for gone in make_room(&mut self.sent, bytes, self.budget, self.kept, &self.on_screen) {
                         kitty::delete(&mut out, gone, wrap);
                         self.placed.retain(|(placed, _)| *placed != gone);
                     }
@@ -885,13 +922,13 @@ impl Pager<'_> {
 }
 
 /// Room in the terminal for a page of `incoming` bytes: the least recently shown pages not
-/// `on_screen` go while keeping them would make more than [`MAX_SENT`] pages, or more than
-/// `budget` bytes. The ids of the ones that go.
-fn make_room(sent: &mut Vec<Sent>, incoming: u64, budget: u64, on_screen: &[Option<View>; 2]) -> Vec<u32> {
+/// `on_screen` go while keeping them would make more than `most` pages, or more than `budget`
+/// bytes. The ids of the ones that go.
+fn make_room(sent: &mut Vec<Sent>, incoming: u64, budget: u64, most: usize, on_screen: &[Option<View>]) -> Vec<u32> {
     let mut gone = Vec::new();
     loop {
         let bytes = sent.iter().map(Sent::bytes).fold(incoming, u64::saturating_add);
-        if sent.len() < MAX_SENT && bytes <= budget {
+        if sent.len() < most && bytes <= budget {
             break;
         }
         let Some(at) = sent.iter().position(|s| !on_screen.contains(&Some(s.view))) else { break };
@@ -912,7 +949,7 @@ fn pixel_bytes((w, h): (f32, f32), scale: f32) -> u64 {
 
 /// What the status line says about the pages on screen, the first page's first: why one failed,
 /// or what was skipped on one.
-fn note(on_screen: &[Option<View>; 2], sent: &[Sent], failed: &[(View, String)]) -> Option<String> {
+fn note(on_screen: &[Option<View>], sent: &[Sent], failed: &[(View, String)]) -> Option<String> {
     on_screen.iter().flatten().find_map(|v| {
         let failure = failed.iter().find(|(f, _)| f == v).map(|(_, e)| e.clone());
         failure.or_else(|| sent.iter().find(|s| s.view == *v).and_then(|s| s.warning.clone()))
@@ -941,9 +978,9 @@ mod tests {
     /// A reader at `at` in a `count`-page document, after a draw that showed `visible` of a
     /// page's `rows` rows, one page to the screen.
     fn reader(at: usize, count: usize, visible: u16, rows: u16) -> Nav {
-        let mut nav = Nav::new((0..count).collect(), count, Fit::Page);
+        let mut nav = Nav::new((0..count).collect(), count, Zoom::Auto);
         nav.go(at);
-        nav.shown(1, visible, rows);
+        nav.shown(visible, rows);
         nav
     }
 
@@ -980,7 +1017,7 @@ mod tests {
         // Back from the top of page 2 lands on the bottom of page 1, once the draw clamps it.
         press(&mut nav, &[Key::Char('b')]);
         assert_eq!(page(&nav), 0);
-        nav.shown(1, 30, 100);
+        nav.shown(30, 100);
         assert_eq!(nav.scroll, 70);
         press(&mut nav, &[Key::Char('k')]);
         assert_eq!(nav.scroll, 70 - STEP);
@@ -989,7 +1026,7 @@ mod tests {
         // At the bottom, a row more is the next page.
         press(&mut nav, &[Key::Down]);
         assert_eq!((page(&nav), nav.scroll), (1, 0));
-        nav.shown(1, 30, 100);
+        nav.shown(30, 100);
         press(&mut nav, &[Key::Enter]);
         assert_eq!((page(&nav), nav.scroll), (1, STEP));
     }
@@ -1014,7 +1051,7 @@ mod tests {
     #[test]
     fn two_pages_side_by_side_turn_like_a_book() {
         let mut nav = reader(0, 5, 40, 40);
-        nav.shown(2, 40, 40);
+        nav.grid(2, 1, 8);
         assert_eq!(nav.on_screen(), [Some(0), Some(1)]);
         for (keys, expected) in [
             (&[Key::Char(' ')][..], [Some(2), Some(3)]),
@@ -1031,18 +1068,81 @@ mod tests {
         // A typed page shows the spread it is on: page 4 is the right page of 3–4.
         press(&mut nav, &[Key::Char('4'), Key::Enter]);
         assert_eq!(nav.on_screen(), [Some(2), Some(3)]);
-        // One to a screen again from where the reader is, at once: a key before the next draw
-        // steps by one page.
-        press(&mut nav, &[Key::Char('d')]);
-        assert!(!nav.two_up);
-        assert_eq!(nav.on_screen(), [Some(3), None]);
+        // Zoomed in, one to a screen from where the reader is, at once: a key before the next
+        // draw steps by one page.
+        press(&mut nav, &[Key::Char('+')]);
+        assert_eq!(nav.zoom, Zoom::PerRow(1));
+        assert_eq!(nav.on_screen(), [Some(3)]);
         press(&mut nav, &[Key::Char('p')]);
-        assert_eq!(nav.on_screen(), [Some(2), None]);
-        // Fitting the width shows one page too.
-        press(&mut nav, &[Key::Char('d')]);
-        nav.shown(2, 40, 40);
-        press(&mut nav, &[Key::Char('f'), Key::Char('n')]);
-        assert_eq!(nav.on_screen(), [Some(3), None]);
+        assert_eq!(nav.on_screen(), [Some(2)]);
+        // As wide as the window, one page too.
+        press(&mut nav, &[Key::Char('+'), Key::Char('n')]);
+        assert_eq!((nav.zoom, nav.on_screen()), (Zoom::Width, vec![Some(3)]));
+    }
+
+    #[test]
+    fn plus_and_minus_zoom_between_the_width_and_the_most_pages_to_a_row() {
+        let mut nav = reader(4, 20, 40, 40);
+        // Out, a page more to a row each time, from the reader's row: page 5 stays on screen.
+        press(&mut nav, &[Key::Char('-')]);
+        assert_eq!((nav.zoom, nav.on_screen()), (Zoom::PerRow(2), vec![Some(4), Some(5)]));
+        press(&mut nav, &[Key::Char('-')]);
+        assert_eq!((nav.zoom, nav.on_screen()), (Zoom::PerRow(3), vec![Some(3), Some(4), Some(5)]));
+        assert!(nav.status("a.pdf", 120, false).contains(" pages 4–6/20 · 3 per row "));
+        // Keys before the next draw step by the new row.
+        press(&mut nav, &[Key::Char('n')]);
+        assert_eq!(nav.on_screen(), [Some(6), Some(7), Some(8)]);
+        // `_` is `-` with Shift. A window that takes four to a row stops there, and says so.
+        press(&mut nav, &[Key::Char('_')]);
+        nav.grid(4, 1, 4);
+        press(&mut nav, &[Key::Char('-')]);
+        assert_eq!((nav.zoom, nav.message.as_deref()), (Zoom::PerRow(4), Some("fully zoomed out")));
+        // In, a page fewer each time (`=` is `+` without Shift), then the width, and no further.
+        press(&mut nav, &[Key::Char('+'), Key::Char('='), Key::Char('+')]);
+        assert_eq!(nav.zoom, Zoom::PerRow(1));
+        press(&mut nav, &[Key::Char('+')]);
+        assert_eq!(nav.zoom, Zoom::Width);
+        assert!(nav.status("a.pdf", 120, false).contains(" page 7/20 · width "));
+        press(&mut nav, &[Key::Char('+')]);
+        assert_eq!((nav.zoom, nav.message.as_deref()), (Zoom::Width, Some("fully zoomed in")));
+        press(&mut nav, &[Key::Char('-')]);
+        assert_eq!(nav.zoom, Zoom::PerRow(1));
+        // From Auto, a step from what the last draw showed.
+        let mut auto = reader(0, 20, 40, 40);
+        auto.grid(2, 1, 8);
+        press(&mut auto, &[Key::Char('-')]);
+        assert_eq!(auto.zoom, Zoom::PerRow(3));
+        let mut auto = reader(0, 20, 40, 40);
+        auto.grid(2, 1, 8);
+        press(&mut auto, &[Key::Char('+')]);
+        assert_eq!(auto.zoom, Zoom::PerRow(1));
+    }
+
+    #[test]
+    fn a_grid_turns_a_screen_or_a_row_and_ends_with_the_last_row_at_the_bottom() {
+        // Ten pages, three to a row in two rows.
+        let mut nav = Nav::new((0..10).collect(), 10, Zoom::PerRow(3));
+        nav.grid(3, 2, 8);
+        nav.shown(20, 20);
+        let screen = |first: usize| (first..first + 6).map(|p| (p < 10).then_some(p)).collect::<Vec<_>>();
+        assert_eq!(nav.on_screen(), screen(0));
+        assert!(nav.status("a.pdf", 120, false).contains(" pages 1–6/10 · 3 per row "));
+        assert_eq!(nav.around(2, 1), [6, 7, 8, 9]);
+        // A screen on is the last row and the one above: the last row stays at the bottom.
+        for (key, first) in [(Key::Char(' '), 6), (Key::Char('b'), 0), (Key::Char('j'), 3), (Key::Down, 6), (Key::Char('j'), 6), (Key::Char('k'), 3)]
+        {
+            press(&mut nav, &[key]);
+            assert_eq!(nav.on_screen(), screen(first), "{key:?}");
+        }
+        for (keys, first) in [(&[Key::Char('G')][..], 6), (&[Key::Char('p')], 0), (&[Key::Char('n')], 6), (&[Key::Home], 0)] {
+            press(&mut nav, keys);
+            assert_eq!(nav.on_screen(), screen(first), "{keys:?}");
+        }
+        // A typed page shows the row it is on, at the top when it can be.
+        press(&mut nav, &[Key::Char('5'), Key::Enter]);
+        assert_eq!(nav.on_screen(), screen(3));
+        press(&mut nav, &[Key::Char('8'), Key::Enter]);
+        assert_eq!(nav.on_screen(), screen(6));
     }
 
     #[test]
@@ -1050,20 +1150,20 @@ mod tests {
         let mut nav = reader(4, 10, 40, 40);
         assert_eq!(nav.around(2, 1), [5, 6, 3]);
         // Two to a screen, 4–5 on it.
-        nav.shown(2, 40, 40);
+        nav.grid(2, 1, 8);
         assert_eq!(nav.around(2, 1), [6, 7, 8, 9, 2, 3]);
         // At the ends, only what exists.
         assert_eq!(reader(9, 10, 40, 40).around(2, 1), [8]);
         assert!(reader(0, 1, 40, 40).around(2, 1).is_empty());
         // However many screens are asked for, the ends stop it.
-        assert!(Nav::new(Vec::new(), 0, Fit::Page).around(usize::MAX, usize::MAX).is_empty());
+        assert!(Nav::new(Vec::new(), 0, Zoom::Auto).around(usize::MAX, usize::MAX).is_empty());
         assert_eq!(reader(1, 3, 40, 40).around(usize::MAX, usize::MAX), [2, 0]);
     }
 
     #[test]
     fn pages_given_are_the_only_ones_paged_through() {
-        let mut nav = Nav::new(vec![6, 2, 9], 12, Fit::Page);
-        nav.shown(1, 40, 40);
+        let mut nav = Nav::new(vec![6, 2, 9], 12, Zoom::Auto);
+        nav.shown(40, 40);
         assert_eq!(page(&nav), 6);
         press(&mut nav, &[Key::Char(' ')]);
         assert_eq!(page(&nav), 2);
@@ -1074,7 +1174,7 @@ mod tests {
         press(&mut nav, &[Key::Char('5'), Key::Enter]);
         assert_eq!(page(&nav), 6);
         assert_eq!(nav.message.as_deref(), Some("page 5 isn't one of the pages given"));
-        assert!(nav.status("a.pdf", 120, false).contains(" page 7/12 · fit page · 1 of 3 "));
+        assert!(nav.status("a.pdf", 120, false).contains(" page 7/12 · 1 per row · 1 of 3 "));
     }
 
     #[test]
@@ -1102,12 +1202,14 @@ mod tests {
     }
 
     #[test]
-    fn q_and_ctrl_c_quit_and_f_switches_the_fit() {
+    fn q_and_ctrl_c_quit_and_r_renders_again() {
         let mut nav = reader(0, 2, 30, 100);
-        press(&mut nav, &[Key::Char(' '), Key::Char('f')]);
-        assert_eq!((nav.fit, nav.scroll), (Fit::Width, 0));
-        press(&mut nav, &[Key::Char('f')]);
-        assert_eq!(nav.fit, Fit::Page);
+        // Zooming starts at the top of the page.
+        press(&mut nav, &[Key::Char(' '), Key::Char('+')]);
+        assert_eq!((nav.zoom, nav.scroll), (Zoom::Width, 0));
+        // `f` and `d`, which fitted the width and turned two-up off, are keys no more.
+        press(&mut nav, &[Key::Char('f'), Key::Char('d')]);
+        assert_eq!((nav.zoom, nav.per_row), (Zoom::Width, 1));
         press(&mut nav, &[Key::Char('r')]);
         assert!(nav.rerender);
         assert_eq!(press(&mut nav, &[Key::Char('q')]), Step::Quit);
@@ -1117,10 +1219,13 @@ mod tests {
 
     #[test]
     fn an_empty_list_shows_no_page_and_never_panics() {
-        let mut nav = Nav::new(Vec::new(), 0, Fit::Page);
-        nav.shown(2, 1, 1);
+        let mut nav = Nav::new(Vec::new(), 0, Zoom::Auto);
+        nav.grid(2, 1, 1);
+        nav.shown(1, 1);
         assert_eq!(nav.on_screen(), [None, None]);
-        press(&mut nav, &[Key::Char(' '), Key::Char('b'), Key::Char('n'), Key::Char('p'), Key::Char('G'), Key::Char('1'), Key::Enter]);
+        let keys = [' ', 'b', 'j', 'k', 'n', 'p', 'G', '-', '-', '+', '+', '+', '1'].map(Key::Char);
+        press(&mut nav, &keys);
+        press(&mut nav, &[Key::Enter]);
         assert!(nav.status("a.pdf", 80, false).contains("no page"));
     }
 
@@ -1132,10 +1237,10 @@ mod tests {
             assert_eq!(line.chars().count(), usize::from(cols), "{line:?}");
         }
         let wide = nav.status("report.pdf", 120, false);
-        assert!(wide.starts_with(" report.pdf · page 3/12 · fit page ") && wide.ends_with("q quit "), "{wide:?}");
+        assert!(wide.starts_with(" report.pdf · page 3/12 · 1 per row ") && wide.ends_with("q quit "), "{wide:?}");
         let mut two = reader(2, 12, 40, 40);
-        two.shown(2, 40, 40);
-        assert!(two.status("report.pdf", 120, false).starts_with(" report.pdf · pages 3–4/12 · fit page "));
+        two.grid(2, 1, 8);
+        assert!(two.status("report.pdf", 120, false).starts_with(" report.pdf · pages 3–4/12 · 2 per row "));
         let mut typing = nav;
         typing.key(Key::Char('7'));
         assert!(typing.status("a.pdf", 80, false).contains("go to page 7"));
@@ -1144,7 +1249,7 @@ mod tests {
     #[test]
     fn a_narrow_status_line_keeps_its_two_sides_apart() {
         let nav = reader(4, 13, 40, 40);
-        let left = " pdfcraft-showcase.pdf · page 5/13 · fit page ";
+        let left = " pdfcraft-showcase.pdf · page 5/13 · 1 per row ";
         // Half a wide window: the shortest reminder of the keys, two spaces from the page.
         let half = nav.status("pdfcraft-showcase.pdf", 70, false);
         assert!(half.starts_with(left) && half.ends_with("  n p · q quit "), "{half:?}");
@@ -1160,10 +1265,10 @@ mod tests {
         }
         // The file name gives way to the page, and to a message, which stays whole.
         let long = "a file name long enough to fill most of the window.pdf";
-        assert_eq!(nav.status(long, 50, false), " a file name long enough… · page 5/13 · fit page  ");
+        assert_eq!(nav.status(long, 50, false), " a file name long enoug… · page 5/13 · 1 per row  ");
         let mut told = nav;
         told.message = Some("no page 99 (1–13)".into());
-        assert_eq!(told.status(long, 60, false), " a file name lon… · page 5/13 · fit page  no page 99 (1–13) ");
+        assert_eq!(told.status(long, 60, false), " a file name lo… · page 5/13 · 1 per row  no page 99 (1–13) ");
     }
 
     #[test]
@@ -1180,7 +1285,7 @@ mod tests {
 
     /// Page `page` sent as image `id`, `mb` megabytes of pixels, with `warning`.
     fn sent(page: usize, id: u32, mb: u32, warning: Option<&str>) -> Sent {
-        let view = View { page, fit: Fit::Page, cols: 50, size: FALLBACK_SIZE };
+        let view = View { page, fit: Fit::Page, cols: 50, rows: 40, size: FALLBACK_SIZE };
         Sent { view, id, cols: 50, rows: 40, width: 1024, height: mb * 256, warning: warning.map(String::from) }
     }
 
@@ -1189,19 +1294,20 @@ mod tests {
         let mut kept: Vec<Sent> = (0..4).map(|p| sent(p, p as u32 + 1, 10, None)).collect();
         let screen = [Some(kept[0].view), None];
         // 40 MB kept, 10 more coming: under 64, nothing goes.
-        assert!(make_room(&mut kept, 10 << 20, 64 << 20, &screen).is_empty());
+        assert!(make_room(&mut kept, 10 << 20, 64 << 20, MAX_SENT, &screen).is_empty());
         // Under 32: the least recently shown go first, never the page on screen.
-        assert_eq!(make_room(&mut kept, 10 << 20, 32 << 20, &screen), [2, 3]);
+        assert_eq!(make_room(&mut kept, 10 << 20, 32 << 20, MAX_SENT, &screen), [2, 3]);
         assert_eq!(kept.iter().map(|s| s.id).collect::<Vec<_>>(), [1, 4]);
         // A page bigger than the whole budget: all but the screen go, and it goes in anyway.
-        assert_eq!(make_room(&mut kept, 100 << 20, 32 << 20, &screen), [4]);
+        assert_eq!(make_room(&mut kept, 100 << 20, 32 << 20, MAX_SENT, &screen), [4]);
         assert_eq!(kept.len(), 1);
-        // And never more than MAX_SENT pages, however small.
+        // And never more than the most pages kept, however small: a grid's screens keep more.
         let mut many: Vec<Sent> = (0..MAX_SENT).map(|p| sent(p, p as u32, 1, None)).collect();
-        assert_eq!(make_room(&mut many, 1, u64::MAX, &[None, None]), [0]);
+        assert!(make_room(&mut many, 1, u64::MAX, 4 * MAX_SENT, &[]).is_empty());
+        assert_eq!(make_room(&mut many, 1, u64::MAX, MAX_SENT, &[None, None]), [0]);
         // Sizes that would overflow don't.
         let mut huge = vec![Sent { width: u32::MAX, height: u32::MAX, ..sent(0, 1, 1, None) }];
-        assert_eq!(make_room(&mut huge, u64::MAX, BUDGET, &[None, None]), [1]);
+        assert_eq!(make_room(&mut huge, u64::MAX, BUDGET, MAX_SENT, &[None, None]), [1]);
     }
 
     #[test]
@@ -1217,7 +1323,7 @@ mod tests {
     #[test]
     fn the_status_line_names_what_is_wrong_with_a_page_on_screen_whenever_it_is() {
         let kept = [sent(0, 1, 1, None), sent(1, 2, 1, Some("page 2: content past the page's safety budget was skipped"))];
-        let view = |page| Some(View { page, fit: Fit::Page, cols: 50, size: FALLBACK_SIZE });
+        let view = |page| Some(View { page, fit: Fit::Page, cols: 50, rows: 40, size: FALLBACK_SIZE });
         // Page 2 was rendered ahead with something skipped: said when it shows, not before.
         assert_eq!(note(&[view(0), None], &kept, &[]), None);
         assert_eq!(note(&[view(1), None], &kept, &[]).as_deref(), Some("page 2: content past the page's safety budget was skipped"));
@@ -1229,7 +1335,7 @@ mod tests {
 
     #[test]
     fn source_rows_follow_the_scroll() {
-        let view = View { page: 0, fit: Fit::Width, cols: 50, size: FALLBACK_SIZE };
+        let view = View { page: 0, fit: Fit::Width, cols: 50, rows: 40, size: FALLBACK_SIZE };
         let shown = Sent { view, id: 1, cols: 50, rows: 100, width: 1000, height: 2000, warning: None };
         assert_eq!(source_rows(&shown, 0, 30), Rect { x: 0, y: 0, w: 1000, h: 600 });
         assert_eq!(source_rows(&shown, 70, 30), Rect { x: 0, y: 1400, w: 1000, h: 600 });
@@ -1238,5 +1344,38 @@ mod tests {
         assert_eq!((past.y, past.h), (2000, 0));
         let empty = Sent { rows: 0, height: 0, ..shown };
         assert_eq!(source_rows(&empty, 5, 5), Rect { x: 0, y: 0, w: 1000, h: 0 });
+    }
+
+    proptest::proptest! {
+        /// Whatever the reader presses, zooming included, and however the draws in between lay
+        /// the pages out, the reader's page is on screen, and the screen starts a row of pages.
+        #[test]
+        fn the_readers_page_is_always_on_screen(
+            count in 1usize..40,
+            steps in proptest::collection::vec(
+                (proptest::sample::select(vec![' ', 'b', 'j', 'k', 'n', 'p', 'g', 'G', '+', '-', '=', '_']),
+                 proptest::option::of((1u16..=8, 1u16..=8, 1u16..=8))),
+                0..40,
+            ),
+        ) {
+            let mut nav = reader(0, count, 40, 40);
+            for (key, draw) in steps {
+                nav.key(Key::Char(key));
+                if let Some((auto, rows, most)) = draw {
+                    // As a draw does: the zoom asked, as far as the window takes.
+                    let (per_row, rows) = match nav.zoom {
+                        Zoom::Width => (1, 1),
+                        Zoom::PerRow(n) => (n.min(most), rows),
+                        Zoom::Auto => (auto.min(2), rows),
+                    };
+                    nav.grid(per_row, rows, most);
+                    nav.shown(40, 40);
+                }
+                let on_screen = nav.on_screen();
+                proptest::prop_assert!(nav.at < count && on_screen.contains(&Some(nav.at)), "{nav:?}");
+                proptest::prop_assert_eq!(nav.first() % nav.row(), 0);
+                proptest::prop_assert_eq!(on_screen.len(), nav.per_screen());
+            }
+        }
     }
 }
