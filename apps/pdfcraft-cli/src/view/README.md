@@ -206,8 +206,9 @@ The terminal tests skip with a warning where tmux or script(1) can't run, so CI 
 them pass.
 
 To try a real kitty without touching your own, run `kitty --start-as=hidden --config NONE` with
-`TMUX` and `TMUX_PANE` unset (an inherited `TMUX` makes `view` think it is inside your tmux, and
-changes options on your pane), and use a private `tmux -L <name>` server for tmux.
+`TMUX` and `TMUX_PANE` unset (an inherited `TMUX` makes `view` think it is inside your tmux: it
+asks your tmux server about your pane, and wraps its escape codes for a tmux that isn't there),
+and use a private `tmux -L <name>` server for tmux.
 
 ## Clean room
 
