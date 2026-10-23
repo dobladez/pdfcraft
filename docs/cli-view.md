@@ -134,7 +134,8 @@ protocol gets an error that says so, and nothing is drawn.
 Over SSH, the image is sent inside the escape codes themselves, so `view` works there too.
 
 `view` fails when stdout isn't a terminal, unless `--protocol kitty` is given. Windows isn't
-supported yet: Windows Terminal speaks sixel, not the kitty protocol.
+supported yet: Windows Terminal speaks sixel, not the kitty protocol. Sixel may come later, which
+would also bring the terminals that speak only sixel.
 
 ## Inside tmux
 

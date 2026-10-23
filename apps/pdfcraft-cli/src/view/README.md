@@ -25,6 +25,14 @@ through tmux, the same answers, the 320 MB quota and the cell size.
 
 `view` is Unix only (macOS, Linux, FreeBSD): it needs `/dev/tty`. Nothing in it is `unsafe`.
 
+Sixel isn't supported yet, and is a possible later addition. It is DEC's older image format, the
+one Windows Terminal speaks (as do xterm, foot, WezTerm and others), so it is the way to bring
+`view` to Windows and to more terminals. It would be a second output beside `kitty.rs` more than a
+change to it: sixel keeps no images in the terminal by id, and has no temporary files and no
+Unicode placeholders, so every page turn sends the page's pixels again, and pictures go through a
+palette (commonly 256 colours). On Windows, `tty.rs` would also need the console's own API for raw
+mode and the window size, through a crate, since the workspace forbids `unsafe`.
+
 ## Getting pages to the terminal
 
 A rendered page is premultiplied RGBA. The protocol offers three ways to send it:
