@@ -226,20 +226,30 @@ fn view(args: &[String]) -> Result<(), CliError> {
     let has = |name: &str| args.iter().any(|a| a == name);
     let paging = Paging::from_flags(has("--pager"), has("--no-pager"))?;
     let tty = Tty::open().ok();
-    let terminal = if tmux::inside() {
+    let paging = paging.pages(pages.len(), std::io::stdout().is_terminal() && tty.is_some());
+    let inside_tmux = tmux::inside();
+    // Paging, the terminal stays in raw mode from the first question on (outside tmux, which is
+    // asked instead), never back in canonical mode between a question and the pager. On FreeBSD a
+    // read begun in canonical mode stays a line read after raw mode returns: the reader thread,
+    // its next read begun in between, would hold every key until Enter.
+    let _raw = match (&tty, paging && !inside_tmux) {
+        (Some(tty), true) => Some(tty.raw().map_err(|e| format!("view: {e}"))?),
+        _ => None,
+    };
+    let terminal = if inside_tmux {
         tmux_terminal(protocol)?
     } else {
         check_terminal(protocol, tty.as_ref())?;
         let cell = tty.as_ref().and_then(ask_cell);
         Terminal { output: Output::Direct, cell, effort: PngEffort::Fast, files: false }
     };
-    let (effort, files) = compression.choose(|| over_ssh(env_ssh(), tmux::inside().then(tmux::attached_over_ssh).flatten()));
+    let (effort, files) = compression.choose(|| over_ssh(env_ssh(), inside_tmux.then(tmux::attached_over_ssh).flatten()));
     let terminal = Terminal { effort, files, ..terminal };
     let first_id = fresh_index();
-    if paging.pages(pages.len(), std::io::stdout().is_terminal() && tty.is_some()) {
-        let tty = tty.ok_or("view: --pager needs a terminal to read keys from")?;
+    if paging {
+        let tty = tty.as_ref().ok_or("view: --pager needs a terminal to read keys from")?;
         let name = std::path::Path::new(path).file_name().map_or_else(|| path.into(), |n| n.to_string_lossy());
-        return pager::run(&tty, &doc, &name, &terminal, pages, fit, first_id).map_err(|e| format!("view: {e}").into());
+        return pager::run(tty, &doc, &name, &terminal, pages, fit, first_id).map_err(|e| format!("view: {e}").into());
     }
     let size = tty.as_ref().and_then(Tty::size).unwrap_or(FALLBACK_SIZE);
     print_pages(&doc, &pages, fit, size, &terminal, first_id)

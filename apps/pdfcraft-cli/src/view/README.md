@@ -201,6 +201,13 @@ that, and the temporary files removed after it, so a slow filesystem can't hold 
 in raw mode. File names, error messages and warnings are written with their control characters
 replaced (`printable`), so a document can't send escape sequences through them.
 
+When it will page, `view` takes raw mode before it asks the terminal anything (whether it speaks
+the protocol, its cell size), and keeps it until the pager ends, never back in canonical mode
+between the two. On FreeBSD a read begun in canonical mode stays a line read after raw mode
+returns: had the reader thread begun its next read in such a gap, no key would reach the pager
+until Enter. Found by CI on FreeBSD, where two pager tests hung after `q`; the race shows there
+only.
+
 ## Tests
 
 - **Unit tests** in each module, among them property tests for the key decoder and the fit.

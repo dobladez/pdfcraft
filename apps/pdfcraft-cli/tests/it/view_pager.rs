@@ -407,6 +407,26 @@ fn a_terminal_without_pixels_is_asked_its_cell_size() {
 }
 
 #[test]
+fn the_first_key_after_the_cell_size_question_reaches_the_pager() {
+    if !pty_works() {
+        return;
+    }
+    // On FreeBSD a read begun in canonical mode stays a line read after raw mode returns. Were
+    // the terminal back in canonical mode between the question and the pager, a reader whose next
+    // read began in that gap would hold every key until Enter: `q` would never quit. Whether a
+    // read begins in the gap is a race, which many sessions at once, each asked its cell size
+    // (no pixel size here), make likely to show.
+    let pdf = fixture("first-key", 2);
+    let sessions: Vec<Session> = (0..16).map(|_| Session::start(&pdf, &["--protocol", "kitty"], 80, 60)).collect();
+    for mut view in sessions {
+        view.wait_until("page 1 shown", |t| t.contains(" page 1/2 ") && t.contains("q quit"));
+        assert_eq!(view.text().matches("\x1b[16t").count(), 1, "asked its cell size");
+        view.press("q");
+        assert!(view.finish().success());
+    }
+}
+
+#[test]
 fn one_page_is_printed_without_the_pager() {
     if !pty_works() {
         return;
