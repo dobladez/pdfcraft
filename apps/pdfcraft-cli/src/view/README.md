@@ -195,11 +195,11 @@ replaced (`printable`), so a document can't send escape sequences through them.
 ## Tests
 
 - **Unit tests** in each module, among them property tests for the key decoder and the fit.
-- **`tests/view.rs`**: printing, through a pipe with `--protocol kitty`.
-- **`tests/view_pager.rs`**: the pager on a pseudo-terminal from script(1), keys in through its
+- **`tests/it/view.rs`**: printing, through a pipe with `--protocol kitty`.
+- **`tests/it/view_pager.rs`**: the pager on a pseudo-terminal from script(1), keys in through its
   stdin. It plays a terminal that takes temporary files (it reads each file named, checks its
   size, deletes it) or one that doesn't, and sends kitty's answers.
-- **`tests/view_tmux.rs`**: the pager in a private tmux server (`tmux -L`, killed at the end), its
+- **`tests/it/view_tmux.rs`**: the pager in a private tmux server (`tmux -L`, killed at the end), its
   clients on script(1) pseudo-terminals. It covers flips, a hidden pane, and a second client.
 
 The terminal tests skip with a warning where tmux or script(1) can't run, so CI machines without
