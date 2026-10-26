@@ -593,14 +593,23 @@ fn encode(p: &RenderedPage, effort: PngEffort) -> Result<Image, String> {
     Ok(Image { png: png(p, effort)?, warning })
 }
 
-/// Why a page failed to render, or what the reader should know about it, if anything. Both name
-/// the page.
+/// Why a page failed to render, or what the reader should know about it, if anything: what
+/// `render` warns about, in its words. Both name the page.
 fn checked(p: &RenderedPage) -> Result<Option<String>, String> {
     let number = p.request.page.saturating_add(1);
     if let Some(e) = &p.error {
         return Err(format!("page {number}: {e}"));
     }
-    Ok(p.warnings.contains(&RenderWarning::ContentTruncated).then(|| format!("page {number}: content past the page's safety budget was skipped")))
+    // Each at most once: the renderer reports a warning once a page.
+    let said: Vec<&str> = p
+        .warnings
+        .iter()
+        .map(|w| match w {
+            RenderWarning::ContentTruncated => "content past the page's safety budget was skipped",
+            RenderWarning::ColourFallback => "a colour that could not be computed was painted in a fallback colour",
+        })
+        .collect();
+    Ok((!said.is_empty()).then(|| format!("page {number}: {}", said.join("; "))))
 }
 
 /// A rendered page's pixels as a PNG. Errors name the page.
@@ -703,5 +712,25 @@ mod tests {
         assert_eq!(Protocol::parse("auto"), Ok(Protocol::Auto));
         assert_eq!(Protocol::parse("kitty"), Ok(Protocol::Kitty));
         assert!(Protocol::parse("sixel").is_err_and(|e| e.contains("auto or kitty")));
+    }
+
+    /// Page 3 rendered with `warnings`, or failed with `error`.
+    fn rendered(warnings: Vec<RenderWarning>, error: Option<&str>) -> RenderedPage {
+        let request = RenderRequest { page: 2, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0, preview: false };
+        let rgba = pdfcraft_render::Pixels::from(Vec::new());
+        RenderedPage { request, width: 0, height: 0, rgba, error: error.map(String::from), text: None, warnings, millis: 0 }
+    }
+
+    #[test]
+    fn a_page_says_everything_the_renderer_warned_about() {
+        assert_eq!(checked(&rendered(Vec::new(), None)), Ok(None));
+        let fallback = "a colour that could not be computed was painted in a fallback colour";
+        assert_eq!(checked(&rendered(vec![RenderWarning::ColourFallback], None)), Ok(Some(format!("page 3: {fallback}"))));
+        assert_eq!(
+            checked(&rendered(vec![RenderWarning::ContentTruncated, RenderWarning::ColourFallback], None)),
+            Ok(Some(format!("page 3: content past the page's safety budget was skipped; {fallback}")))
+        );
+        // A page that failed says only that.
+        assert_eq!(checked(&rendered(vec![RenderWarning::ColourFallback], Some("no page box"))), Err("page 3: no page box".into()));
     }
 }

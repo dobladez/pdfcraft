@@ -162,6 +162,33 @@ fn a_dynamic_xfa_form_shows_its_laid_out_pages() {
     assert_eq!(std::fs::read(&pdf).unwrap(), original, "viewing must not write the layout to the file");
 }
 
+/// A colour the renderer can't compute is painted in a fallback colour (#4260): `view` says so,
+/// in the words `render` uses.
+#[test]
+fn a_colour_painted_in_a_fallback_colour_is_said() {
+    // A Separation colour whose tint transform is of no known function type.
+    let content = "/CS1 cs 1 scn 0 0 200 200 re f";
+    let bytes = format!(
+        "%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+         2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+         3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+         /Resources << /ColorSpace << /CS1 [/Separation /Spot /DeviceRGB << /FunctionType 7 /Domain [0 1] >>] >> >> /Contents 4 0 R >> endobj\n\
+         4 0 obj << /Length {} >> stream\n{content}\nendstream endobj\n\
+         trailer << /Root 1 0 R >>\n%%EOF",
+        content.len()
+    );
+    let pdf = tmp("fallback", "fallback.pdf");
+    std::fs::write(&pdf, bytes).unwrap();
+    let said = "warning: page 1: a colour that could not be computed was painted in a fallback colour";
+    let png = tmp("fallback", "page.png");
+    let render = Command::new(BIN).arg("render").arg(&pdf).arg("--out").arg(&png).output().unwrap();
+    assert!(render.status.success() && text(&render.stderr).contains(said), "render: {}", text(&render.stderr));
+    let out = view(&pdf, &["--protocol", "kitty"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(images(&out.stdout).len(), 1, "the page is still drawn");
+    assert!(text(&out.stderr).contains(said), "{}", text(&out.stderr));
+}
+
 #[test]
 fn zoom_width_is_wider_than_a_page_to_a_row() {
     let pdf = fixture("fit", 1);

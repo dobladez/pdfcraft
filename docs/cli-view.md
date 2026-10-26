@@ -190,6 +190,8 @@ inside tmux even though they draw pages outside it.
   `view` exits with an error.
 - A page whose content runs past the renderer's safety budget is drawn without the rest of its
   content, with a warning, as in `render`.
+- A colour the renderer can't compute (a colour space it can't read, a tint transform it can't
+  evaluate) is painted in a fallback colour, with a warning, as in `render`.
 - File names and messages are written with their control characters replaced, so neither a file
   name nor a document can send escape sequences (a clipboard write, a window title) to the
   terminal through them.
